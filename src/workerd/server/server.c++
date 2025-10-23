@@ -3845,9 +3845,10 @@ struct Server::WorkerDef {
 
 class Server::WorkerLoaderNamespace: public kj::Refcounted {
  public:
-  WorkerLoaderNamespace(Server& server, kj::String namespaceName)
+  WorkerLoaderNamespace(Server& server, kj::String namespaceName, size_t maxDynamicWorkers = 100)
       : server(server),
-        namespaceName(kj::mv(namespaceName)) {}
+        namespaceName(kj::mv(namespaceName)),
+        maxDynamicWorkers(maxDynamicWorkers) {}
 
   void unlink() {
     for (auto& isolate: isolates) {
@@ -3857,23 +3858,43 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted {
 
   kj::Own<WorkerStubChannel> loadIsolate(
       kj::String name, kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource) {
-    return isolates
-        .findOrCreate(name,
-            [&]() -> decltype(isolates)::Entry {
-      // This name isn't actually used in any maps nor is it ever revealed back to the app, but it
-      // may be used in error logs.
-      auto isolateName = kj::str(namespaceName, ':', name);
+    auto lock = lruList.lockExclusive();
 
-      return {.key = kj::mv(name),
-        .value = kj::rc<WorkerStubImpl>(server, kj::mv(isolateName), kj::mv(fetchSource))};
-    })
-        .addRef()
-        .toOwn();
+    // Check if worker already exists in cache
+    KJ_IF_SOME(existing, isolates.find(name)) {
+      // Cache hit! Move to end of LRU list (most recently used)
+      touchWorker(*lock, *existing.get());
+      return kj::addRef(*existing.get());
+    }
+
+    // Cache miss - need to create new worker
+    // First, evict LRU if at capacity
+    if (isolates.size() >= maxDynamicWorkers) {
+      evictLru(*lock);
+    }
+
+    // This name isn't actually used in any maps nor is it ever revealed back to the app, but it
+    // may be used in error logs.
+    auto isolateName = kj::str(namespaceName, ':', name);
+
+    // Create new worker
+    auto worker = kj::rc<WorkerStubImpl>(server, kj::mv(isolateName), kj::mv(fetchSource));
+
+    // Add to LRU list (most recently used = end of list)
+    lock->add(*worker.get());
+
+    // Add to HashMap for fast lookup
+    auto& inserted = isolates.upsert(kj::mv(name), kj::mv(worker), [](auto&, auto&&) {
+      KJ_FAIL_ASSERT("Worker already exists in map but not found earlier");
+    });
+
+    return kj::addRef(*inserted.value.get());
   }
 
  private:
   Server& server;
   kj::String namespaceName;
+  size_t maxDynamicWorkers;
 
   class WorkerStubImpl;
   kj::HashMap<kj::String, kj::Rc<WorkerStubImpl>> isolates;
@@ -3926,6 +3947,11 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted {
    private:
     kj::Maybe<kj::Own<WorkerService>> service;  // null if still starting up
     kj::ForkedPromise<void> startupTask;        // resolves when `service` is non-null
+
+    // LRU tracking - link for membership in WorkerLoaderNamespace's LRU list
+    kj::ListLink<WorkerStubImpl> lruLink;
+
+    friend class WorkerLoaderNamespace;
 
     kj::Promise<void> start(Server& server,
         kj::String isolateName,
@@ -4126,6 +4152,46 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted {
       }
     };
   };
+
+  // LRU list: front = least recently used, back = most recently used
+  kj::MutexGuarded<kj::List<WorkerStubImpl, &WorkerStubImpl::lruLink>> lruList;
+
+  // Move worker to end of LRU list (mark as recently used)
+  void touchWorker(
+      kj::List<WorkerStubImpl, &WorkerStubImpl::lruLink>& list, WorkerStubImpl& worker) {
+    if (worker.lruLink.isLinked()) {
+      list.remove(worker);
+    }
+    list.add(worker);
+  }
+
+  // Evict least recently used worker (front of list)
+  void evictLru(kj::List<WorkerStubImpl, &WorkerStubImpl::lruLink>& list) {
+    KJ_REQUIRE(!list.empty(), "Cannot evict from empty LRU list");
+
+    // Get LRU worker (front of list)
+    WorkerStubImpl& lruWorker = list.front();
+
+    // Find the worker's name in the HashMap so we can remove it
+    kj::String* nameToRemove = nullptr;
+    for (auto& entry: isolates) {
+      if (entry.value.get() == &lruWorker) {
+        nameToRemove = &entry.key;
+        break;
+      }
+    }
+
+    KJ_REQUIRE(nameToRemove != nullptr, "LRU worker not found in isolates map");
+
+    // Unlink the worker's resources
+    lruWorker.unlink();
+
+    // Remove from list
+    list.remove(lruWorker);
+
+    // Remove from HashMap (this will drop the Rc, potentially destroying the worker)
+    isolates.erase(*nameToRemove);
+  }
 };
 
 void Server::unlinkWorkerLoaders() {
