@@ -174,12 +174,14 @@ DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
   CompatibilityFlags::Reader compatFlags = *ownCompatFlags;
 
   Frankenvalue env;
+  size_t retainedEnvSize = 0;
   KJ_IF_SOME(codeEnv, code.env) {
     env = Frankenvalue::fromJs(js, codeEnv.getHandle(js));
     auto estimate = env.estimateSize();
     JSG_REQUIRE(estimate <= MAX_DYNAMIC_WORKER_ENV_SIZE, Error, "Dynamic Worker env size (",
         estimate, " bytes) exceeds the maximum allowed size of ", MAX_DYNAMIC_WORKER_ENV_SIZE,
         " bytes.");
+    retainedEnvSize = estimate;
   }
 
   kj::Maybe<kj::Rc<IoChannelFactory::SubrequestChannel>> globalOutbound;
@@ -223,13 +225,19 @@ DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
     };
   }
 
-  return {.source = kj::mv(extractedSource),
+  size_t maxRetainedSize = kj::maxValue;
+  size_t estimatedRetainedSize = extractedSource.retainedSize > maxRetainedSize - retainedEnvSize
+      ? maxRetainedSize
+      : extractedSource.retainedSize + retainedEnvSize;
+
+  return {.source = kj::mv(extractedSource.source),
     .compatibilityFlags = compatFlags,
     .limits = code.limits,
     .env = kj::mv(env),
     .globalOutbound = kj::mv(globalOutbound),
     .tails = kj::mv(tailChannels),
     .streamingTails = kj::mv(streamingTailChannels),
+    .estimatedRetainedSize = estimatedRetainedSize,
     .ownContent = ownCompatFlags.attach(kj::mv(code.modules), kj::mv(code.mainModule)),
     .ownContentIsRpcResponse = false};
 }
@@ -247,7 +255,7 @@ static Worker::Script::ModuleContent extractWasmModuleContent(
   };
 }
 
-Worker::Script::Source WorkerLoader::extractSource(jsg::Lock& js, WorkerCode& code) {
+WorkerLoader::ExtractedSource WorkerLoader::extractSource(jsg::Lock& js, WorkerCode& code) {
   JSG_REQUIRE(code.modules.fields.size() > 0, TypeError,
       "Dynamic Worker code must contain at least one module.");
 
@@ -398,10 +406,14 @@ Worker::Script::Source WorkerLoader::extractSource(jsg::Lock& js, WorkerCode& co
       totalCodeSize, " bytes) exceeds the maximum allowed size of ", MAX_DYNAMIC_WORKER_CODE_SIZE,
       " bytes.");
 
-  return Worker::Script::ModulesSource{
-    .mainModule = code.mainModule,
-    .modules = kj::mv(modules),
-    .isPython = isPython,
+  return {
+    .source =
+        Worker::Script::ModulesSource{
+          .mainModule = code.mainModule,
+          .modules = kj::mv(modules),
+          .isPython = isPython,
+        },
+    .retainedSize = totalCodeSize,
   };
 }
 

@@ -513,6 +513,14 @@ struct Worker {
         # from it, they'll end up sharing the same loaded Worker.
         #
         # (If omitted, the binding will not share a cache with any other binding.)
+
+        maxCachedMemoryBytes @29 :UInt64;
+        # Optional soft limit on the approximate memory used by named Workers cached by this
+        # loader. When the limit is exceeded, the least-recently-used Workers are removed from the
+        # cache. Existing stubs and active requests remain valid until their references are
+        # released. Zero (the default) means unlimited.
+        #
+        # Bindings which specify the same `id` must also specify the same limit.
       }
 
       workerdDebugPort @28 :Void;

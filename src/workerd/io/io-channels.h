@@ -603,6 +603,10 @@ struct DynamicWorkerSource {
   kj::Array<kj::Rc<IoChannelFactory::SubrequestChannel>> tails;
   kj::Array<kj::Rc<IoChannelFactory::SubrequestChannel>> streamingTails;
 
+  // Approximate number of non-V8 bytes retained for the lifetime of this Worker, such as source
+  // code and the serialized environment. Embedders that cannot estimate this may leave it at 0.
+  size_t estimatedRetainedSize = 0;
+
   // Owns any data structures pointed into by the other members. (E.g. `source` contains a lot of
   // `StringPtr`s; `ownContent` owns the backing buffer for them.)
   kj::Own<void> ownContent;
@@ -627,6 +631,7 @@ struct DynamicWorkerSource {
       .globalOutbound = globalOutbound.clone(),
       .tails = KJ_MAP(t, tails) { return t.addRef(); },
       .streamingTails = KJ_MAP(t, streamingTails) { return t.addRef(); },
+      .estimatedRetainedSize = estimatedRetainedSize,
       .ownContent = kj::mv(newOwnContent),
       .ownContentIsRpcResponse = ownContentIsRpcResponse,
     };
