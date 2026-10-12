@@ -76,6 +76,8 @@ jobs:
           cp bazel-bin/src/workerd/server/workerd /tmp/workerd
           /tmp/workerd --version
           gzip -9N -c /tmp/workerd > /tmp/workerd-${{ matrix.arch }}.gz
+      - name: Smoke test
+        run: ./ploy/smoke-test/run.sh /tmp/workerd
       - uses: actions/upload-artifact@v4
         with:
           name: workerd-${{ matrix.arch }}

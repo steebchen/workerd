@@ -22,7 +22,8 @@ await worker.getEntrypoint(undefined, { limits: { cpuMs: 1000 } }).fetch(request
   `Worker exceeded CPU time limit.` (outcome `exceededCpu`). The isolate keeps serving other
   requests.
 - Implementation: `src/workerd/server/cpu-limit-enforcer.c++`. Tests:
-  `src/workerd/api/tests/worker-loader-cpu-limit-test.js`.
+  `src/workerd/api/tests/worker-loader-cpu-limit-test.js`, plus `ploy/smoke-test/run.sh`, which the
+  release workflow runs against the built binary.
 
 ## Releasing
 
