@@ -1,6 +1,9 @@
-# Builds Ploy's workerd (upstream release + Ploy patches), runs the Worker Loader tests and
-# publishes the Linux binaries as GitHub release `v<upstream>-ploy.<run number>`, where <upstream>
-# comes from `.ploy-upstream-version`. Runs on every push to `ploy/main`.
+# Builds Ploy's workerd (upstream release + Ploy patches) and runs the Worker Loader tests and a
+# smoke test on every push to `ploy/main`. Pushing a tag `v<upstream>-ploy.<n>` also publishes the
+# Linux binaries as a GitHub release for that tag.
+#
+# The tag must be pushed by a person: GITHUB_TOKEN cannot create refs on this fork, because its
+# default branch carries different workflow files (that needs the `workflows` permission).
 #
 # Runs on standard GitHub runners without Cloudflare's remote cache, so a cold build is slow. The
 # Bazel disk cache is saved even when the build times out, so re-running the workflow resumes
@@ -11,6 +14,8 @@ on:
   push:
     branches:
       - ploy/main
+    tags:
+      - 'v*-ploy.*'
   workflow_dispatch:
 
 permissions:
@@ -86,13 +91,9 @@ jobs:
 
   release:
     needs: build
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          show-progress: false
-          sparse-checkout: .ploy-upstream-version
-          sparse-checkout-cone-mode: false
       - uses: actions/download-artifact@v4
         with:
           pattern: workerd-*
@@ -102,13 +103,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          upstream="$(tr -d '[:space:]' < .ploy-upstream-version)"
-          tag="v${upstream}-ploy.${GITHUB_RUN_NUMBER}"
+          tag="${GITHUB_REF_NAME}"
+          upstream="${tag%%-ploy.*}"
           cd dist
           sha256sum workerd-*.gz > SHA256SUMS
           cat SHA256SUMS
           gh release create "${tag}" workerd-*.gz SHA256SUMS \
             --repo "${GITHUB_REPOSITORY}" \
-            --target "${GITHUB_SHA}" \
             --title "${tag}" \
-            --notes "workerd v${upstream} with Ploy's patches (${GITHUB_SHA}). See PLOY.md."
+            --notes "workerd ${upstream} with Ploy's patches (${GITHUB_SHA}). See PLOY.md."
