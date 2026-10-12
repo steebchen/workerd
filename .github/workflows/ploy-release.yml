@@ -1,5 +1,6 @@
-# Builds Ploy's workerd (upstream release + Ploy patches) and publishes the Linux binaries as a
-# GitHub release. Triggered by pushing a tag like `v1.20261012.1-ploy.1`.
+# Builds Ploy's workerd (upstream release + Ploy patches), runs the Worker Loader tests and
+# publishes the Linux binaries as GitHub release `v<upstream>-ploy.<run number>`, where <upstream>
+# comes from `.ploy-upstream-version`. Runs on every push to `ploy/main`.
 #
 # Runs on standard GitHub runners without Cloudflare's remote cache, so a cold build is slow. The
 # Bazel disk cache is saved even when the build times out, so re-running the workflow resumes
@@ -8,8 +9,9 @@ name: Ploy release
 
 on:
   push:
-    tags:
-      - 'v*-ploy.*'
+    branches:
+      - ploy/main
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -83,6 +85,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          show-progress: false
+          sparse-checkout: .ploy-upstream-version
+          sparse-checkout-cone-mode: false
       - uses: actions/download-artifact@v4
         with:
           pattern: workerd-*
@@ -92,10 +99,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          upstream="$(tr -d '[:space:]' < .ploy-upstream-version)"
+          tag="v${upstream}-ploy.${GITHUB_RUN_NUMBER}"
           cd dist
           sha256sum workerd-*.gz > SHA256SUMS
           cat SHA256SUMS
-          gh release create "${GITHUB_REF_NAME}" workerd-*.gz SHA256SUMS \
+          gh release create "${tag}" workerd-*.gz SHA256SUMS \
             --repo "${GITHUB_REPOSITORY}" \
-            --title "${GITHUB_REF_NAME}" \
-            --notes "workerd ${GITHUB_REF_NAME%%-ploy.*} with Ploy patches. See PLOY.md."
+            --target "${GITHUB_SHA}" \
+            --title "${tag}" \
+            --notes "workerd v${upstream} with Ploy's patches (${GITHUB_SHA}). See PLOY.md."

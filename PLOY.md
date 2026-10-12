@@ -26,8 +26,9 @@ await worker.getEntrypoint(undefined, { limits: { cpuMs: 1000 } }).fetch(request
 
 ## Releasing
 
-1. Rebase `ploy/main` onto the upstream release tag (`git rebase v1.YYYYMMDD.N`).
-2. Tag `v1.YYYYMMDD.N-ploy.M` and push the tag. The workflow builds `linux-64` and `linux-arm64`,
-   runs the Worker Loader tests and publishes `workerd-<arch>.gz` plus `SHA256SUMS`.
+1. Rebase `ploy/main` onto the upstream release tag (`git rebase v1.YYYYMMDD.N`) and write that
+   version to `.ploy-upstream-version`.
+2. Push `ploy/main`. The workflow builds `linux-64` and `linux-arm64`, runs the Worker Loader tests
+   and publishes `workerd-<arch>.gz` plus `SHA256SUMS` as release `v1.YYYYMMDD.N-ploy.<run>`.
 3. A cold build can exceed the 6 hour job limit; re-run the failed job and it resumes from the
    saved Bazel cache.
