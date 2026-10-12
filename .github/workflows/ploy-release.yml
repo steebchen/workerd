@@ -1,0 +1,101 @@
+# Builds Ploy's workerd (upstream release + Ploy patches) and publishes the Linux binaries as a
+# GitHub release. Triggered by pushing a tag like `v1.20261012.1-ploy.1`.
+#
+# Runs on standard GitHub runners without Cloudflare's remote cache, so a cold build is slow. The
+# Bazel disk cache is saved even when the build times out, so re-running the workflow resumes
+# where the previous attempt stopped.
+name: Ploy release
+
+on:
+  push:
+    tags:
+      - 'v*-ploy.*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ploy-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: linux-64
+            runner: ubuntu-24.04
+          - arch: linux-arm64
+            runner: ubuntu-24.04-arm
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/local/.ghcup /usr/share/swift || true
+          sudo docker image prune --all --force || true
+          df -h /
+      - uses: actions/checkout@v4
+        with:
+          show-progress: false
+      - name: Restore Bazel cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/bazel-disk-cache
+          key: ploy-bazel-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ploy-bazel-${{ matrix.arch }}-
+      - name: Setup runner
+        uses: ./.github/actions/setup-runner
+        with:
+          GOOGLESOURCE_COOKIE: ''
+      - name: Build and test
+        id: build
+        timeout-minutes: 330
+        run: |
+          bazel test --config=ci --config=release_linux --strip=always \
+            --build_tests_only=false --test_output=errors \
+            //src/workerd/server:workerd \
+            //src/workerd/api/tests:worker-loader-cpu-limit-test@ \
+            //src/workerd/api/tests:worker-loader-limits-test@ \
+            //src/workerd/api/tests:worker-loader-test@
+      - name: Save Bazel cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/bazel-disk-cache
+          key: ploy-bazel-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Package binary
+        run: |
+          cp bazel-bin/src/workerd/server/workerd /tmp/workerd
+          /tmp/workerd --version
+          gzip -9N -c /tmp/workerd > /tmp/workerd-${{ matrix.arch }}.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: workerd-${{ matrix.arch }}
+          path: /tmp/workerd-${{ matrix.arch }}.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: workerd-*
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum workerd-*.gz > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "${GITHUB_REF_NAME}" workerd-*.gz SHA256SUMS \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "workerd ${GITHUB_REF_NAME%%-ploy.*} with Ploy patches. See PLOY.md."

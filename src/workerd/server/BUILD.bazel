@@ -334,9 +334,11 @@ wd_cc_library(
 wd_cc_library(
     name = "server",
     srcs = [
+        "cpu-limit-enforcer.c++",
         "server.c++",
     ],
     hdrs = [
+        "cpu-limit-enforcer.h",
         "server.h",
     ],
     deps = [

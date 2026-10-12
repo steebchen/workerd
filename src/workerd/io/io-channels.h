@@ -198,6 +198,10 @@ class IoChannelFactory: public virtual kj::Refcounted {
 
     // Address of the client as IP:port on whose behalf this request is being made.
     kj::Maybe<kj::String> clientAddress;
+
+    // CPU time limit for a request to a dynamically-loaded worker, from
+    // `WorkerStub.getEntrypoint(name, {limits: {cpuMs}})`. Enforced by workerd's server.
+    kj::Maybe<uint32_t> cpuLimitMs;
   };
 
   // Parameters that can influence the version of a worker that is used to serve a subrequest.

@@ -6,6 +6,7 @@
 
 #include "alarm-scheduler.h"
 #include "container-client.h"
+#include "cpu-limit-enforcer.h"
 #include "pyodide.h"
 #include "workerd-api.h"
 
@@ -3986,6 +3987,10 @@ class Server::WorkerService final: public Service,
       kj::Maybe<kj::Own<Worker::Actor>> actor,
       bool isTracer,
       kj::Maybe<kj::Own<AccessInfo>> accessInfo) {
+    kj::Maybe<uint32_t> cpuLimitMs = defaultCpuLimitMs;
+    KJ_IF_SOME(ms, metadata.cpuLimitMs) {
+      cpuLimitMs = ms;
+    }
     auto& channels = KJ_ASSERT_NONNULL(ioChannels.tryGet<LinkedIoChannels>());
 
     kj::Vector<kj::Own<WorkerInterface>> bufferedTailWorkers(channels.tails.size());
@@ -4105,8 +4110,7 @@ class Server::WorkerService final: public Service,
     }
 
     return newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName.clone(),
-        kj::mv(props), kj::mv(actor),
-        kj::attachRef(static_cast<LimitEnforcer&>(*this), kj::addRef(*this)),
+        kj::mv(props), kj::mv(actor), makeLimitEnforcer(cpuLimitMs),
         {},  // ioContextDependency
         addRefToThis(), kj::mv(observer), waitUntilTasks,
         true,                  // tunnelExceptions
@@ -4118,8 +4122,23 @@ class Server::WorkerService final: public Service,
         kj::mv(metadata.clientAddress));
   }
 
+  // CPU limit for requests that do not set their own, from the dynamic worker's
+  // `WorkerCode.limits.cpuMs`.
+  void setDefaultCpuLimitMs(kj::Maybe<uint32_t> ms) {
+    defaultCpuLimitMs = ms;
+  }
+
  private:
   class EntrypointService;
+
+  kj::Maybe<uint32_t> defaultCpuLimitMs;
+
+  kj::Own<LimitEnforcer> makeLimitEnforcer(kj::Maybe<uint32_t> cpuLimitMs) {
+    KJ_IF_SOME(ms, cpuLimitMs) {
+      return newCpuLimitEnforcer(ms * kj::MILLISECONDS);
+    }
+    return kj::attachRef(static_cast<LimitEnforcer&>(*this), kj::addRef(*this));
+  }
 
   // `SelfTokenFactory` for a static (non-dynamic) worker entrypoint. This is a little wonky
   // because self-tokens need to be encoded as persistent as long as the worker itself has
@@ -5444,7 +5463,12 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
 
     kj::Rc<IoChannelFactory::SubrequestChannel> getEntrypointResolved(
         kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits) override {
-      return kj::rc<SubrequestChannelImpl>(addRefToThis(), kj::mv(name), kj::mv(props));
+      kj::Maybe<uint32_t> cpuLimitMs;
+      KJ_IF_SOME(l, limits) {
+        cpuLimitMs = l.cpuMs;
+      }
+      return kj::rc<SubrequestChannelImpl>(
+          addRefToThis(), kj::mv(name), kj::mv(props), cpuLimitMs);
     }
 
     kj::Rc<IoChannelFactory::ActorClassChannel> getActorClassResolved(
@@ -5572,16 +5596,23 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
       service->linkActorNamespaces(errorReporter);
       errorReporter.throwIfErrors();
 
+      KJ_IF_SOME(limits, source.limits) {
+        service->setDefaultCpuLimitMs(limits.cpuMs);
+      }
+
       this->service = kj::mv(service);
     }
 
     class SubrequestChannelImpl final: public IoChannelFactory::SubrequestChannel {
      public:
-      SubrequestChannelImpl(
-          kj::Rc<WorkerStubImpl> isolate, kj::Maybe<kj::String> entrypointName, Frankenvalue props)
+      SubrequestChannelImpl(kj::Rc<WorkerStubImpl> isolate,
+          kj::Maybe<kj::String> entrypointName,
+          Frankenvalue props,
+          kj::Maybe<uint32_t> cpuLimitMs = kj::none)
           : isolate(kj::mv(isolate)),
             entrypointName(kj::mv(entrypointName)),
-            props(kj::mv(props)) {}
+            props(kj::mv(props)),
+            cpuLimitMs(cpuLimitMs) {}
 
       kj::Own<WorkerInterface> startRequest(
           IoChannelFactory::SubrequestMetadata metadata) override {
@@ -5611,10 +5642,14 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
       kj::Rc<WorkerStubImpl> isolate;
       kj::Maybe<kj::String> entrypointName;
       Frankenvalue props;  // moved away when `entrypointService` is initialized
+      kj::Maybe<uint32_t> cpuLimitMs;
 
       kj::Maybe<kj::Rc<Service>> entrypointService;
 
       kj::Own<WorkerInterface> startRequestImpl(IoChannelFactory::SubrequestMetadata metadata) {
+        if (metadata.cpuLimitMs == kj::none) {
+          metadata.cpuLimitMs = cpuLimitMs;
+        }
         auto& service = KJ_ASSERT_NONNULL(isolate->service);
         if (entrypointService == kj::none) {
           entrypointService = service->getEntrypoint(entrypointName, kj::mv(props));
