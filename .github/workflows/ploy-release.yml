@@ -1,9 +1,7 @@
 # Builds Ploy's workerd (upstream release + Ploy patches) and runs the Worker Loader tests and a
 # smoke test on every push to `ploy/main`. Pushing a tag `v<upstream>-ploy.<n>` also publishes the
 # Linux binaries as a GitHub release for that tag.
-#
-# The tag must be pushed by a person: GITHUB_TOKEN cannot create refs on this fork, because its
-# default branch carries different workflow files (that needs the `workflows` permission).
+# Releases are cut deliberately rather than on every push.
 #
 # Runs on standard GitHub runners without Cloudflare's remote cache, so a cold build is slow. The
 # Bazel disk cache is saved even when the build times out, so re-running the workflow resumes
