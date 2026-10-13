@@ -3125,7 +3125,8 @@ namespace {
 class RequestObserverWithTracer final: public RequestObserver, public WorkerInterface {
  public:
   RequestObserverWithTracer(kj::Maybe<kj::Rc<WorkerTracer>> tracer, kj::TaskSet& waitUntilTasks)
-      : tracer(kj::mv(tracer)) {}
+      : tracer(kj::mv(tracer)),
+        start(kj::systemPreciseMonotonicClock().now()) {}
 
   ~RequestObserverWithTracer() noexcept(false) {
     KJ_IF_SOME(t, tracer) {
@@ -3134,7 +3135,10 @@ class RequestObserverWithTracer final: public RequestObserver, public WorkerInte
         auto time = ioContext.now();
         t->recordTimestamp(time);
       }
-      t->setOutcome(outcome, cpuTime, 0 * kj::MILLISECONDS /* wall time */);
+      // Wall time runs from when the request reached this worker (including any wait for the
+      // isolate lock) until the request and its waitUntil() tasks finished.
+      auto wallTime = kj::systemPreciseMonotonicClock().now() - start;
+      t->setOutcome(outcome, cpuTime, wallTime);
     }
   }
 
@@ -3264,6 +3268,7 @@ class RequestObserverWithTracer final: public RequestObserver, public WorkerInte
   kj::Maybe<WorkerInterface&> inner;
   EventOutcome outcome = EventOutcome::OK;
   kj::Duration cpuTime = 0 * kj::MILLISECONDS;
+  kj::TimePoint start;
 };
 
 class SequentialSpanSubmitter final: public SpanSubmitter {

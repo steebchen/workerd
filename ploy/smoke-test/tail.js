@@ -1,11 +1,13 @@
-// Records the cpuTime of tail events for the tenant, like Ploy's log worker forwards it.
-const cpuTimes = [];
+// Records cpuTime and wallTime of the tenant's tail events, like Ploy's log worker forwards them.
+// GET returns one "<cpuTime> <wallTime>" line per event.
+const events = [];
 
 export default {
-  tail(events) {
-    for (const event of events) cpuTimes.push(event.cpuTime);
+  tail(batch) {
+    for (const event of batch)
+      events.push(`${event.cpuTime} ${event.wallTime}`);
   },
   fetch() {
-    return Response.json(cpuTimes);
+    return new Response(events.map((line) => line + '\n').join(''));
   },
 };

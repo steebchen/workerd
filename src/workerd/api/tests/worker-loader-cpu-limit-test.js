@@ -183,7 +183,13 @@ export class CpuTail extends WorkerEntrypoint {
     events = JSON.parse(JSON.stringify(events));
     await this.ctx.exports.RendezvousActor.getByName(
       this.ctx.props.name
-    ).resolve(events.map((e) => ({ cpuTime: e.cpuTime, outcome: e.outcome })));
+    ).resolve(
+      events.map((e) => ({
+        cpuTime: e.cpuTime,
+        wallTime: e.wallTime,
+        outcome: e.outcome,
+      }))
+    );
   }
 }
 
@@ -223,10 +229,15 @@ export let tailReportsCpuTime = {
       `cpuTime ${event.cpuTime}ms, burn took ${burnMs}ms`
     );
     assert.ok(event.cpuTime <= burnMs * 3 + 50, `cpuTime ${event.cpuTime}ms`);
+    // Wall time covers the CPU time plus everything else the request waited on.
+    assert.ok(
+      event.wallTime >= event.cpuTime,
+      `wallTime ${event.wallTime}ms < cpuTime ${event.cpuTime}ms`
+    );
   },
 };
 
-// Waiting on I/O is not CPU time.
+// Waiting on I/O is not CPU time, but it is wall time.
 export let tailExcludesIdleTime = {
   async test(ctrl, env, ctx) {
     const event = await tailedRequest(
@@ -237,6 +248,9 @@ export let tailExcludesIdleTime = {
     );
     assert.strictEqual(event.outcome, 'ok');
     assert.ok(event.cpuTime < 100, `cpuTime ${event.cpuTime}ms`);
+    // ...but it is wall time (upstream reports 0 here).
+    assert.ok(event.wallTime >= 250, `wallTime ${event.wallTime}ms`);
+    assert.ok(event.wallTime < 10_000, `wallTime ${event.wallTime}ms`);
   },
 };
 

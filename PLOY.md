@@ -39,6 +39,13 @@ same measurement the CPU limit uses:
 - On Linux the watchdog also reads the CPU clock of the thread it guards, so `cpuMs` counts CPU
   time, not wall time: a request preempted on a busy node is not cut off early.
 
+### Wall time in tail events
+
+Upstream also reports `wallTime: 0`. This build reports the time from when the request reached the
+worker (including any wait for the isolate lock) until the request and its `waitUntil()` tasks
+finished, measured on the monotonic clock in `RequestObserverWithTracer`. `wallTime - cpuTime` is
+the time the request spent waiting: on I/O, or on other requests holding the isolate thread.
+
 ## Releasing
 
 1. Rebase `ploy/main` onto the upstream release tag (`git rebase v1.YYYYMMDD.N`) and push it. The

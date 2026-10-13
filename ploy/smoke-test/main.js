@@ -16,7 +16,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/ping") return new Response("pong");
-    if (url.pathname === "/tail-cpu") return env.tail.fetch("http://tail/");
+    if (url.pathname === "/tail-times") return env.tail.fetch("http://tail/");
     const cpuMs = url.searchParams.get("cpuMs");
     const worker = env.loader.get("tenant", () => ({
       compatibilityDate: "2025-09-15",
