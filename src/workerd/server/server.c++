@@ -3134,8 +3134,7 @@ class RequestObserverWithTracer final: public RequestObserver, public WorkerInte
         auto time = ioContext.now();
         t->recordTimestamp(time);
       }
-      t->setOutcome(
-          outcome, 0 * kj::MILLISECONDS /* cpu time */, 0 * kj::MILLISECONDS /* wall time */);
+      t->setOutcome(outcome, cpuTime, 0 * kj::MILLISECONDS /* wall time */);
     }
   }
 
@@ -3145,6 +3144,10 @@ class RequestObserverWithTracer final: public RequestObserver, public WorkerInte
       return *this;
     }
     return worker;
+  }
+
+  void reportCpuTime(kj::Duration time) override {
+    cpuTime += time;
   }
 
   void reportFailure(
@@ -3260,6 +3263,7 @@ class RequestObserverWithTracer final: public RequestObserver, public WorkerInte
   kj::Maybe<kj::Rc<WorkerTracer>> tracer;
   kj::Maybe<WorkerInterface&> inner;
   EventOutcome outcome = EventOutcome::OK;
+  kj::Duration cpuTime = 0 * kj::MILLISECONDS;
 };
 
 class SequentialSpanSubmitter final: public SpanSubmitter {
@@ -4133,11 +4137,10 @@ class Server::WorkerService final: public Service,
 
   kj::Maybe<uint32_t> defaultCpuLimitMs;
 
+  // Every request measures its CPU time (reported to tail workers as `cpuTime`); only requests
+  // with a limit are cut off.
   kj::Own<LimitEnforcer> makeLimitEnforcer(kj::Maybe<uint32_t> cpuLimitMs) {
-    KJ_IF_SOME(ms, cpuLimitMs) {
-      return newCpuLimitEnforcer(ms * kj::MILLISECONDS);
-    }
-    return kj::attachRef(static_cast<LimitEnforcer&>(*this), kj::addRef(*this));
+    return newCpuLimitEnforcer(cpuLimitMs.map([](uint32_t ms) { return ms * kj::MILLISECONDS; }));
   }
 
   // `SelfTokenFactory` for a static (non-dynamic) worker entrypoint. This is a little wonky

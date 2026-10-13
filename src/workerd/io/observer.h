@@ -179,6 +179,10 @@ class RequestObserver: public kj::Refcounted {
   // occurred asynchronously.
   virtual void reportFailure(const kj::Exception& e, FailureSource source = FailureSource::OTHER) {}
 
+  // Called with CPU time the worker spent running JavaScript on behalf of this request. May be
+  // called more than once; the request's total is the sum.
+  virtual void reportCpuTime(kj::Duration time) {}
+
   static EventOutcome outcomeFromException(
       const kj::Exception& e, FailureSource source = FailureSource::OTHER);
 

@@ -7,10 +7,14 @@ const unitTests :Workerd.Config = (
         modules = [
           (name = "worker", esModule = embed "worker-loader-cpu-limit-test.js")
         ],
-        compatibilityFlags = ["nodejs_compat", "experimental"],
+        compatibilityFlags = ["nodejs_compat", "rpc", "enable_ctx_exports", "experimental"],
         bindings = [
           (name = "loader", workerLoader = ()),
         ],
+        durableObjectNamespaces = [
+          (className = "RendezvousActor", uniqueKey = "RendezvousActor"),
+        ],
+        durableObjectStorage = (inMemory = void),
       )
     ),
   ],

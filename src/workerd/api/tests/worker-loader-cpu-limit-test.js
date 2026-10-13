@@ -2,6 +2,7 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 import assert from 'node:assert';
+import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers';
 
 // Tests for `limits.cpuMs` on dynamically-loaded workers, enforced by workerd's server
 // (src/workerd/server/cpu-limit-enforcer.c++).
@@ -31,7 +32,15 @@ const MAIN_MODULE = `
       return "done";
     }
     async fetch(request) {
-      if (new URL(request.url).pathname === "/spin") for (;;) {}
+      const url = new URL(request.url);
+      if (url.pathname === "/spin") for (;;) {}
+      if (url.pathname === "/burn") {
+        return new Response(String(burn(Number(url.searchParams.get("n")))));
+      }
+      if (url.pathname === "/idle") {
+        await scheduler.wait(300);
+        return new Response("idle");
+      }
       return new Response("ok");
     }
   }
@@ -155,5 +164,95 @@ export let noLimitByDefault = {
       await worker.getEntrypoint().burnSlices(5, SLICE_ITERATIONS),
       'done'
     );
+  },
+};
+
+// Tail events are delivered to a different execution context; bounce them back through an actor.
+export class RendezvousActor extends DurableObject {
+  promiseAndResolvers = Promise.withResolvers();
+  resolve(value) {
+    this.promiseAndResolvers.resolve(value);
+  }
+  wait() {
+    return this.promiseAndResolvers.promise;
+  }
+}
+
+export class CpuTail extends WorkerEntrypoint {
+  async tail(events) {
+    events = JSON.parse(JSON.stringify(events));
+    await this.ctx.exports.RendezvousActor.getByName(
+      this.ctx.props.name
+    ).resolve(events.map((e) => ({ cpuTime: e.cpuTime, outcome: e.outcome })));
+  }
+}
+
+async function tailedRequest(env, ctx, name, path, limits) {
+  const worker = load(env, name, {
+    tails: [ctx.exports.CpuTail({ props: { name } })],
+  });
+  const entrypoint = worker.getEntrypoint(undefined, limits && { limits });
+  try {
+    const response = await entrypoint.fetch('http://example.com' + path);
+    await response.text();
+  } catch (e) {
+    assertCpuLimitError(e);
+  }
+  const events = await ctx.exports.RendezvousActor.getByName(name).wait();
+  assert.strictEqual(events.length, 1);
+  return events[0];
+}
+
+// Tail events report the CPU time the request spent in JavaScript (upstream always reports 0).
+export let tailReportsCpuTime = {
+  async test(ctrl, env, ctx) {
+    const calibrate = load(env, 'tailReportsCpuTimeCalibrate');
+    const start = Date.now();
+    await calibrate.getEntrypoint().burn(SLICE_ITERATIONS * 5);
+    const burnMs = Date.now() - start;
+
+    const event = await tailedRequest(
+      env,
+      ctx,
+      'tailReportsCpuTime',
+      `/burn?n=${SLICE_ITERATIONS * 5}`
+    );
+    assert.strictEqual(event.outcome, 'ok');
+    assert.ok(
+      event.cpuTime >= burnMs / 3,
+      `cpuTime ${event.cpuTime}ms, burn took ${burnMs}ms`
+    );
+    assert.ok(event.cpuTime <= burnMs * 3 + 50, `cpuTime ${event.cpuTime}ms`);
+  },
+};
+
+// Waiting on I/O is not CPU time.
+export let tailExcludesIdleTime = {
+  async test(ctrl, env, ctx) {
+    const event = await tailedRequest(
+      env,
+      ctx,
+      'tailExcludesIdleTime',
+      '/idle'
+    );
+    assert.strictEqual(event.outcome, 'ok');
+    assert.ok(event.cpuTime < 100, `cpuTime ${event.cpuTime}ms`);
+  },
+};
+
+// A request cut off by its limit reports the time it was allowed to run and outcome exceededCpu.
+export let tailReportsExceededCpu = {
+  async test(ctrl, env, ctx) {
+    const event = await tailedRequest(
+      env,
+      ctx,
+      'tailReportsExceededCpu',
+      '/spin',
+      {
+        cpuMs: 50,
+      }
+    );
+    assert.strictEqual(event.outcome, 'exceededCpu');
+    assert.ok(event.cpuTime >= 40, `cpuTime ${event.cpuTime}ms`);
   },
 };

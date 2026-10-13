@@ -25,6 +25,20 @@ await worker.getEntrypoint(undefined, { limits: { cpuMs: 1000 } }).fetch(request
   `src/workerd/api/tests/worker-loader-cpu-limit-test.js`, plus `ploy/smoke-test/run.sh`, which the
   release workflow runs against the built binary.
 
+### CPU time in tail events
+
+Upstream reports `cpuTime: 0` for every tail event (`RequestObserverWithTracer` hard-codes it).
+This build reports the CPU time each request spent running JavaScript, for every worker, from the
+same measurement the CPU limit uses:
+
+- The per-request enforcer reads the isolate thread's CPU clock (`CLOCK_THREAD_CPUTIME_ID`) on
+  entering and leaving JavaScript, so I/O waits and OS preemption are not counted.
+- `LimitEnforcer::reportMetrics()`, which IoContext calls whenever a request stops being current,
+  hands the accumulated time to the request's observer (`RequestObserver::reportCpuTime()`), which
+  passes it to `setOutcome()` and so to `TraceItem.cpuTime`.
+- On Linux the watchdog also reads the CPU clock of the thread it guards, so `cpuMs` counts CPU
+  time, not wall time: a request preempted on a busy node is not cut off early.
+
 ## Releasing
 
 1. Rebase `ploy/main` onto the upstream release tag (`git rebase v1.YYYYMMDD.N`) and push it. The

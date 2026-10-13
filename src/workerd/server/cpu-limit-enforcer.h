@@ -11,16 +11,20 @@
 
 namespace workerd::server {
 
-// Returns a per-request LimitEnforcer that caps how long the request may spend executing
-// JavaScript. Once the budget is spent, execution is terminated and the request fails with
-// "Worker exceeded CPU time limit." (outcome `exceededCpu`).
+// Returns a per-request LimitEnforcer that measures the CPU time the request spends executing
+// JavaScript and, when `limit` is set, caps it. Once the budget is spent, execution is terminated
+// and the request fails with "Worker exceeded CPU time limit." (outcome `exceededCpu`).
 //
-// Time is measured as wall time while the request holds the isolate lock, which in workerd is the
-// time it keeps the event-loop thread busy. Waiting on I/O does not count. All other limits are
-// left unenforced, matching workerd's default.
+// Time is the CPU time of the isolate thread while the request holds the isolate lock
+// (CLOCK_THREAD_CPUTIME_ID), so waiting on I/O and being preempted by the OS do not count. Platforms
+// without a per-thread CPU clock fall back to wall time.
 //
-// This backs `limits.cpuMs` for dynamically-loaded workers (Worker Loader), which upstream workerd
-// accepts but does not enforce.
-kj::Own<LimitEnforcer> newCpuLimitEnforcer(kj::Duration limit);
+// The measured time is handed to the request's observer through reportMetrics(), which is how it
+// reaches `TraceItem.cpuTime` in tail workers; upstream workerd always reports 0 there.
+//
+// This also backs `limits.cpuMs` for dynamically-loaded workers (Worker Loader), which upstream
+// workerd accepts but does not enforce. All other limits are left unenforced, matching workerd's
+// default.
+kj::Own<LimitEnforcer> newCpuLimitEnforcer(kj::Maybe<kj::Duration> limit);
 
 }  // namespace workerd::server

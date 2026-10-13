@@ -26,6 +26,19 @@ echo "     spin request took ${spin_s}s, ping during spin took ${ping_ms}ms"
 r=$(t "/ok"); check "isolate still serves after termination" "$(echo $r | cut -d' ' -f1) $(cat /tmp/body)" "200 tenant ok"
 r=$(t "/burn?n=200000000&cpuMs=60000"); check "heavy work within a big budget completes" "$(echo $r | cut -d' ' -f1)" "200"
 r=$(t "/burn?n=2000000000&cpuMs=100"); check "heavy work over budget is cut off" "$(echo $r | cut -d' ' -f1) $(grep -o 'exceeded CPU time limit' /tmp/body)" "503 exceeded CPU time limit"
+sleep 1
+before=$(t "/tail-cpu" >/dev/null; cat /tmp/body)
+r=$(t "/burn?n=300000000"); check "unlimited heavy work completes" "$(echo $r | cut -d' ' -f1)" "200"
+burn_ms=$(echo $r | awk '{printf "%d", $2*1000}')
+sleep 1
+t "/tail-cpu" >/dev/null
+count() { echo "$1" | tr -c '0-9\n' '\n' | grep -c '[0-9]'; }
+after=$(cat /tmp/body)
+cpu_ms=-1
+[ "$(count "$after")" -gt "$(count "$before")" ] && cpu_ms=$(echo "$after" | tr -c '0-9\n' '\n' | grep '[0-9]' | tail -1)
+echo "     tail cpuTime ${cpu_ms}ms for a request that took ${burn_ms}ms"
+[ "$cpu_ms" -ge $((burn_ms / 3)) ] && [ "$cpu_ms" -le $((burn_ms * 2 + 50)) ] && echo "PASS tail reports request CPU time" || { echo "FAIL tail cpuTime ${cpu_ms}ms, request took ${burn_ms}ms"; fail=1; }
+
 r=$(t "/ping"); check "main worker unaffected" "$(echo $r | cut -d' ' -f1) $(cat /tmp/body)" "200 pong"
 kill $PID
 exit $fail

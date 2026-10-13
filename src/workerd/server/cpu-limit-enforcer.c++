@@ -4,6 +4,7 @@
 
 #include "cpu-limit-enforcer.h"
 
+#include <workerd/io/observer.h>
 #include <workerd/jsg/exception.h>
 #include <workerd/jsg/jsg.h>
 #include <workerd/util/exception.h>
@@ -13,12 +14,71 @@
 #include <kj/refcount.h>
 #include <kj/thread.h>
 
+#if defined(__linux__) || defined(__APPLE__)
+#include <time.h>
+#define WORKERD_HAS_THREAD_CPU_CLOCK 1
+#endif
+
+#if defined(__linux__)
+#include <pthread.h>
+#define WORKERD_HAS_FOREIGN_THREAD_CPU_CLOCK 1
+#endif
+
 namespace workerd::server {
 
 namespace {
 
-// Terminates JavaScript that runs past its deadline. A single detached thread serves the whole
-// process; it sleeps until the earliest armed deadline or until a new entry is armed.
+#ifdef WORKERD_HAS_THREAD_CPU_CLOCK
+kj::Duration readCpuClock(clockid_t clock) {
+  struct timespec ts;
+  KJ_SYSCALL(clock_gettime(clock, &ts));
+  return ts.tv_sec * kj::SECONDS + ts.tv_nsec * kj::NANOSECONDS;
+}
+#endif
+
+// CPU time consumed so far by the calling thread. Only differences between two readings on the
+// same thread are meaningful.
+kj::Duration threadCpuNow() {
+#ifdef WORKERD_HAS_THREAD_CPU_CLOCK
+  return readCpuClock(CLOCK_THREAD_CPUTIME_ID);
+#else
+  return kj::systemPreciseMonotonicClock().now() - kj::origin<kj::TimePoint>();
+#endif
+}
+
+// A clock another thread can read to see how much CPU the arming thread has used. Where there is
+// none, the watchdog treats wall time as CPU time, which can only cut a request off early.
+struct ArmingThreadClock {
+#ifdef WORKERD_HAS_FOREIGN_THREAD_CPU_CLOCK
+  kj::Maybe<clockid_t> clock;
+
+  static ArmingThreadClock current() {
+    clockid_t clock;
+    if (pthread_getcpuclockid(pthread_self(), &clock) == 0) {
+      return {.clock = clock};
+    }
+    return {};
+  }
+
+  kj::Maybe<kj::Duration> read() const {
+    KJ_IF_SOME(c, clock) {
+      return readCpuClock(c);
+    }
+    return kj::none;
+  }
+#else
+  static ArmingThreadClock current() {
+    return {};
+  }
+  kj::Maybe<kj::Duration> read() const {
+    return kj::none;
+  }
+#endif
+};
+
+// Terminates JavaScript that runs past its CPU deadline. A single detached thread serves the whole
+// process; it sleeps until the earliest wall-clock point at which some armed request could have
+// spent its budget, or until a new entry is armed.
 class CpuWatchdog {
  public:
   static CpuWatchdog& get() {
@@ -27,10 +87,20 @@ class CpuWatchdog {
     return *instance;
   }
 
-  uint64_t arm(v8::Isolate* isolate, kj::TimePoint deadline) {
+  // `cpuDeadline` is a reading of the arming thread's CPU clock. Since a thread cannot use more
+  // CPU than wall time passes, `start + (cpuDeadline - cpuNow)` is the earliest the deadline can be
+  // reached; the watchdog checks then and re-arms if the thread was not running the whole time.
+  uint64_t arm(v8::Isolate* isolate, kj::Duration cpuNow, kj::Duration cpuDeadline) {
+    auto wallDeadline = kj::systemPreciseMonotonicClock().now() + (cpuDeadline - cpuNow);
     auto lock = state.lockExclusive();
     auto id = lock->nextId++;
-    lock->entries.insert(id, Entry{.isolate = isolate, .deadline = deadline});
+    lock->entries.insert(id,
+        Entry{
+          .isolate = isolate,
+          .clock = ArmingThreadClock::current(),
+          .cpuDeadline = cpuDeadline,
+          .wallDeadline = wallDeadline,
+        });
     ++lock->generation;
     return id;
   }
@@ -50,7 +120,9 @@ class CpuWatchdog {
  private:
   struct Entry {
     v8::Isolate* isolate;
-    kj::TimePoint deadline;
+    ArmingThreadClock clock;
+    kj::Duration cpuDeadline;
+    kj::TimePoint wallDeadline;
     bool fired = false;
   };
   struct State {
@@ -79,16 +151,24 @@ class CpuWatchdog {
         for (auto& slot: lock->entries) {
           auto& entry = slot.value;
           if (entry.fired) continue;
-          if (entry.deadline <= now) {
+          if (entry.wallDeadline <= now) {
+            KJ_IF_SOME(cpuNow, entry.clock.read()) {
+              if (cpuNow < entry.cpuDeadline) {
+                // The thread was preempted or blocked for part of the time; wait for the rest.
+                entry.wallDeadline = now + (entry.cpuDeadline - cpuNow);
+              }
+            }
+          }
+          if (entry.wallDeadline <= now) {
             // Holding the lock guarantees the isolate is still inside the armed JavaScript scope,
             // because disarm() takes the same lock before the scope ends.
             entry.fired = true;
             entry.isolate->TerminateExecution();
           } else {
             KJ_IF_SOME(n, next) {
-              if (entry.deadline < n) next = entry.deadline;
+              if (entry.wallDeadline < n) next = entry.wallDeadline;
             } else {
-              next = entry.deadline;
+              next = entry.wallDeadline;
             }
           }
         }
@@ -97,8 +177,8 @@ class CpuWatchdog {
           timeout = n - now;
         }
       }
-      state.when([generation](const State& s) { return s.generation != generation; },
-          [](State&) {}, timeout);
+      state.when([generation](const State& s) { return s.generation != generation; }, [](State&) {},
+          timeout);
     }
   }
 };
@@ -111,24 +191,32 @@ kj::Exception cpuLimitExceeded() {
 
 class CpuLimitEnforcer final: public LimitEnforcer, public kj::Refcounted {
  public:
-  explicit CpuLimitEnforcer(kj::Duration limit)
+  explicit CpuLimitEnforcer(kj::Maybe<kj::Duration> limit)
       : CpuLimitEnforcer(limit, kj::newPromiseAndFulfiller<void>()) {}
 
   kj::Own<void> enterJs(jsg::Lock& lock, IoContext& context) override {
-    auto& clock = kj::systemPreciseMonotonicClock();
-    auto start = clock.now();
-    auto remaining = used < limit ? limit - used : 0 * kj::NANOSECONDS;
-    auto isolate = lock.v8Isolate;
-    auto id = CpuWatchdog::get().arm(isolate, start + remaining);
-    return kj::heap(kj::defer([this, isolate, id, start]() {
-      bool fired = CpuWatchdog::get().disarm(id);
-      used += kj::systemPreciseMonotonicClock().now() - start;
+    auto start = threadCpuNow();
+    kj::Maybe<uint64_t> armed;
+    KJ_IF_SOME(l, limit) {
+      auto remaining = used < l ? l - used : 0 * kj::NANOSECONDS;
+      armed = CpuWatchdog::get().arm(lock.v8Isolate, start, start + remaining);
+    }
+    return kj::heap(kj::defer([this, isolate = lock.v8Isolate, armed, start]() {
+      bool fired = false;
+      KJ_IF_SOME(id, armed) {
+        fired = CpuWatchdog::get().disarm(id);
+      }
+      auto elapsed = threadCpuNow() - start;
+      used += elapsed;
+      unreported += elapsed;
       if (fired) {
         // If JavaScript returned before V8 noticed the request, the termination is still pending
         // and would hit whatever runs next on this isolate, so clear it.
         isolate->CancelTerminateExecution();
       }
-      if (fired || used >= limit) markExceeded();
+      KJ_IF_SOME(l, limit) {
+        if (fired || used >= l) markExceeded();
+      }
     }));
   }
 
@@ -162,7 +250,12 @@ class CpuLimitEnforcer final: public LimitEnforcer, public kj::Refcounted {
   void requireLimitsNotExceeded() override {
     if (exceeded) kj::throwFatalException(cpuLimitExceeded());
   }
-  void reportMetrics(RequestObserver& requestMetrics) override {}
+  void reportMetrics(RequestObserver& requestMetrics) override {
+    // IoContext calls this when the current incoming request stops being current, so CPU time is
+    // attributed to the request that was current while it was spent.
+    requestMetrics.reportCpuTime(unreported);
+    unreported = 0 * kj::NANOSECONDS;
+  }
   kj::Duration consumeTimeElapsedForPeriodicLogging() override {
     return 0 * kj::SECONDS;
   }
@@ -171,13 +264,16 @@ class CpuLimitEnforcer final: public LimitEnforcer, public kj::Refcounted {
   }
 
  private:
-  kj::Duration limit;
+  kj::Maybe<kj::Duration> limit;
+  // CPU time counted against `limit`; reset for each event delivered to an actor.
   kj::Duration used = 0 * kj::NANOSECONDS;
+  // CPU time not yet handed to a request observer.
+  kj::Duration unreported = 0 * kj::NANOSECONDS;
   bool exceeded = false;
   kj::ForkedPromise<void> exceededPromise;
   kj::Own<kj::PromiseFulfiller<void>> exceededFulfiller;
 
-  CpuLimitEnforcer(kj::Duration limit, kj::PromiseFulfillerPair<void> paf)
+  CpuLimitEnforcer(kj::Maybe<kj::Duration> limit, kj::PromiseFulfillerPair<void> paf)
       : limit(limit),
         exceededPromise(paf.promise.fork()),
         exceededFulfiller(kj::mv(paf.fulfiller)) {}
@@ -191,7 +287,7 @@ class CpuLimitEnforcer final: public LimitEnforcer, public kj::Refcounted {
 
 }  // namespace
 
-kj::Own<LimitEnforcer> newCpuLimitEnforcer(kj::Duration limit) {
+kj::Own<LimitEnforcer> newCpuLimitEnforcer(kj::Maybe<kj::Duration> limit) {
   return kj::refcounted<CpuLimitEnforcer>(limit);
 }
 
