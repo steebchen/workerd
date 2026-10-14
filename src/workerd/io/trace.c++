@@ -1128,6 +1128,15 @@ void Trace::copyTo(rpc::Trace::Builder builder) const {
     fetchResponseInfo.copyTo(fetchResponseInfoBuilder);
   }
 
+  KJ_IF_SOME(sizes, httpBodySizes) {
+    auto sizesBuilder = builder.initHttpBodySizes();
+    sizesBuilder.setRequestBodySize(sizes.requestBodySize);
+    sizesBuilder.setResponseBodySize(sizes.responseBodySize);
+    KJ_IF_SOME(type, sizes.responseContentType) {
+      sizesBuilder.setResponseContentType(type);
+    }
+  }
+
   {
     auto list = builder.initDiagnosticChannelEvents(diagnosticChannelEvents.size());
     for (auto i: kj::indices(diagnosticChannelEvents)) {
@@ -1237,6 +1246,17 @@ void Trace::mergeFrom(rpc::Trace::Reader reader, PipelineLogLevel pipelineLogLev
 
   if (reader.hasResponse()) {
     fetchResponseInfo = tracing::FetchResponseInfo(reader.getResponse());
+  }
+
+  if (reader.hasHttpBodySizes()) {
+    auto sizes = reader.getHttpBodySizes();
+    httpBodySizes = tracing::HttpBodySizes{
+      .requestBodySize = sizes.getRequestBodySize(),
+      .responseBodySize = sizes.getResponseBodySize(),
+      .responseContentType = sizes.hasResponseContentType()
+          ? kj::Maybe<kj::String>(kj::str(sizes.getResponseContentType()))
+          : kj::none,
+    };
   }
 }
 

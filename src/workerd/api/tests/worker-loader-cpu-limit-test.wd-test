@@ -7,7 +7,7 @@ const unitTests :Workerd.Config = (
         modules = [
           (name = "worker", esModule = embed "worker-loader-cpu-limit-test.js")
         ],
-        compatibilityFlags = ["nodejs_compat", "rpc", "enable_ctx_exports", "experimental"],
+        compatibilityFlags = ["nodejs_compat", "rpc", "enable_ctx_exports", "experimental", "streams_enable_constructors"],
         bindings = [
           (name = "loader", workerLoader = ()),
         ],

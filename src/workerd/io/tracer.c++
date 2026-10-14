@@ -477,6 +477,16 @@ void WorkerTracer::setEventInfoInternal(const tracing::InvocationSpanContext& co
   }
 }
 
+void WorkerTracer::setHttpBodySizes(uint64_t requestBodySize,
+    uint64_t responseBodySize,
+    kj::Maybe<kj::String> responseContentType) {
+  trace->httpBodySizes = tracing::HttpBodySizes{
+    .requestBodySize = requestBodySize,
+    .responseBodySize = responseBodySize,
+    .responseContentType = kj::mv(responseContentType),
+  };
+}
+
 void WorkerTracer::setOutcome(EventOutcome outcome, kj::Duration cpuTime, kj::Duration wallTime) {
   trace->outcome = outcome;
   trace->cpuTime = cpuTime;

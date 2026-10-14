@@ -10,7 +10,8 @@ const main :Workerd.Worker = (
     (name = "loader", workerLoader = ()),
     (name = "boundedLoader", workerLoader = (maxCachedMemoryBytes = 134217728)),
     (name = "tail", service = "tail"),
-  ]
+  ],
+  tails = [ "tail" ]
 );
 const tail :Workerd.Worker = (
   modules = [ (name = "tail.js", esModule = embed "tail.js") ],

@@ -59,6 +59,16 @@ rss_after=$(ps -o rss= -p $PID | tr -d ' ')
 echo "     RSS ${rss_before}KiB before, ${rss_after}KiB after loading 20 more 44 MiB tenants (880 MiB uncapped)"
 [ $((rss_after - rss_before)) -lt $((440 * 1024)) ] && echo "PASS memory stays bounded" || { echo "FAIL RSS grew by $(((rss_after - rss_before) / 1024))MiB"; fail=1; }
 
+# Ploy's request log reads body sizes from the main worker's tail event. Upload chunked (no
+# Content-Length) through main to the tenant, which streams back a response without one either.
+head -c 300000 /dev/zero >/tmp/upload
+r=$(curl -s --max-time 10 -o /tmp/body -w '%{http_code} %{size_download}' -H 'Transfer-Encoding: chunked' -H 'Expect:' \
+	--data-binary @/tmp/upload "http://127.0.0.1:8080/upload?size=777777")
+check "streamed upload and download complete" "$r" "200 777777"
+sleep 1
+t "/tail-main" >/dev/null
+check "tail reports streamed body sizes" "$(grep '^/upload ' /tmp/body | tail -1)" "/upload 300000 777777 application/x-ploy-test"
+
 r=$(t "/ping"); check "main worker unaffected" "$(echo $r | cut -d' ' -f1) $(cat /tmp/body)" "200 pong"
 kill $PID
 exit $fail
