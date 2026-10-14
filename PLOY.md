@@ -81,6 +81,10 @@ soft memory budget per loader binding:
 - When the total exceeds the budget, the least recently used Workers are dropped from the cache. A
   stub or request that still holds an evicted Worker keeps it alive until released; the next
   `loader.get()` for that name calls the code callback again and loads a fresh isolate.
+- Each eviction is logged at WARNING (visible at the default log level, and as a JSON line under
+  `logging.structuredLogging`): `evicted dynamic Worker from loader cache; namespace = <binding>;
+  name = <name>; memoryUsage = <bytes>; totalCachedMemory = <bytes>; maxCachedMemory = <bytes>`.
+  Count these per `name` to spot a Worker that is evicted and reloaded repeatedly.
 - Zero (the default) keeps upstream's unbounded behavior. Bindings that share an `id` must use the
   same budget. Unnamed (`loader.load()`) Workers are not cached and not counted.
 - Implementation: `WorkerLoaderNamespace` in `src/workerd/server/server.c++`. Tests:

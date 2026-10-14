@@ -53,6 +53,8 @@ big a >/dev/null; big b >/dev/null; big a >/dev/null; big c >/dev/null
 check "cached tenant is reused" "$(big a)" "a loads=1"
 check "recent tenant stays cached" "$(big c)" "c loads=1"
 check "least recently used tenant is evicted" "$(big b)" "b loads=2"
+evictions=$(grep -c 'evicted dynamic Worker from loader cache; namespace = boundedLoader; name = ' /tmp/wd.log)
+[ "$evictions" -ge 1 ] && echo "PASS evictions are logged ($evictions)" || { echo "FAIL no eviction log line in /tmp/wd.log"; fail=1; }
 rss_before=$(ps -o rss= -p $PID | tr -d ' ')
 i=0; while [ $i -lt 20 ]; do big "n$i" >/dev/null; i=$((i + 1)); done
 rss_after=$(ps -o rss= -p $PID | tr -d ' ')
