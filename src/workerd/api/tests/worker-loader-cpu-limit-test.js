@@ -42,6 +42,20 @@ const MAIN_MODULE = `
         await scheduler.wait(300);
         return new Response("idle");
       }
+      if (url.pathname === "/upload") {
+        // Reads the whole body, then streams back "size" bytes without a Content-Length.
+        await request.arrayBuffer();
+        let remaining = Number(url.searchParams.get("size"));
+        const body = new ReadableStream({
+          pull(controller) {
+            if (remaining === 0) return controller.close();
+            const n = Math.min(remaining, 1000);
+            controller.enqueue(new Uint8Array(n));
+            remaining -= n;
+          },
+        });
+        return new Response(body, {headers: {"content-type": "application/x-ploy-test"}});
+      }
       return new Response("ok");
     }
   }
@@ -261,18 +275,21 @@ export class CpuTail extends WorkerEntrypoint {
         cpuTime: e.cpuTime,
         wallTime: e.wallTime,
         outcome: e.outcome,
+        requestBodySize: e.event?.request?.bodySize,
+        responseBodySize: e.event?.response?.bodySize,
+        responseContentType: e.event?.response?.contentType,
       }))
     );
   }
 }
 
-async function tailedRequest(env, ctx, name, path, limits) {
+async function tailedRequest(env, ctx, name, path, limits, init) {
   const worker = load(env, name, {
     tails: [ctx.exports.CpuTail({ props: { name } })],
   });
   const entrypoint = worker.getEntrypoint(undefined, limits && { limits });
   try {
-    const response = await entrypoint.fetch('http://example.com' + path);
+    const response = await entrypoint.fetch('http://example.com' + path, init);
     await response.text();
   } catch (e) {
     assertCpuLimitError(e);
@@ -341,5 +358,49 @@ export let tailReportsExceededCpu = {
     );
     assert.strictEqual(event.outcome, 'exceededCpu');
     assert.ok(event.cpuTime >= 40, `cpuTime ${event.cpuTime}ms`);
+  },
+};
+
+// Tail events report the bytes the request read from its body and wrote to its response, counted
+// as they stream, so chunked uploads and streamed responses without a Content-Length are covered.
+export let tailReportsStreamedBodySizes = {
+  async test(ctrl, env, ctx) {
+    let chunks = 3;
+    const upload = new ReadableStream({
+      pull(controller) {
+        if (chunks-- === 0) return controller.close();
+        controller.enqueue(new Uint8Array(1500));
+      },
+    });
+    const event = await tailedRequest(
+      env,
+      ctx,
+      'tailReportsStreamedBodySizes',
+      '/upload?size=12345',
+      undefined,
+      { method: 'POST', body: upload }
+    );
+    assert.strictEqual(event.outcome, 'ok');
+    assert.strictEqual(event.requestBodySize, 4500);
+    assert.strictEqual(event.responseBodySize, 12345);
+    assert.strictEqual(event.responseContentType, 'application/x-ploy-test');
+  },
+};
+
+// A body the worker never reads counts as 0; a fixed-length response counts its bytes.
+export let tailReportsUnreadBodyAsZero = {
+  async test(ctrl, env, ctx) {
+    const event = await tailedRequest(
+      env,
+      ctx,
+      'tailReportsUnreadBodyAsZero',
+      '/ok',
+      undefined,
+      { method: 'POST', body: 'ignored body' }
+    );
+    assert.strictEqual(event.outcome, 'ok');
+    assert.strictEqual(event.requestBodySize, 0);
+    assert.strictEqual(event.responseBodySize, 2);
+    assert.strictEqual(event.responseContentType, 'text/plain;charset=UTF-8');
   },
 };

@@ -46,6 +46,16 @@ echo "     tail cpuTime ${cpu_ms}ms wallTime ${wall_ms}ms for a request that too
 r=$(t "/startup-spin"); check "startup loop is cut off" "$(echo $r | cut -d' ' -f1) $(grep -o 'exceeded CPU time limit during startup' /tmp/body)" "503 exceeded CPU time limit during startup"
 echo "     startup-spin request took $(echo $r | cut -d' ' -f2)s"
 
+# Ploy's request log reads body sizes from the main worker's tail event. Upload chunked (no
+# Content-Length) through main to the tenant, which streams back a response without one either.
+head -c 300000 /dev/zero >/tmp/upload
+r=$(curl -s --max-time 10 -o /tmp/body -w '%{http_code} %{size_download}' -H 'Transfer-Encoding: chunked' -H 'Expect:' \
+	--data-binary @/tmp/upload "http://127.0.0.1:8080/upload?size=777777")
+check "streamed upload and download complete" "$r" "200 777777"
+sleep 1
+t "/tail-main" >/dev/null
+check "tail reports streamed body sizes" "$(grep '^/upload ' /tmp/body | tail -1)" "/upload 300000 777777 application/x-ploy-test"
+
 r=$(t "/ping"); check "main worker unaffected" "$(echo $r | cut -d' ' -f1) $(cat /tmp/body)" "200 pong"
 kill $PID
 exit $fail

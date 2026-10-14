@@ -227,6 +227,14 @@ struct Trace @0x8e8d911203762d34 {
   cpuTime @10 :UInt64;
   wallTime @11 :UInt64;
 
+  httpBodySizes @31 :HttpBodySizes;
+  # Ploy: what an HTTP request transferred. Unset for other events.
+  struct HttpBodySizes {
+    requestBodySize @0 :UInt64;
+    responseBodySize @1 :UInt64;
+    responseContentType @2 :Text;
+  }
+
   dispatchNamespace @12 :Text;
   scriptTags @14 :List(Text);
 

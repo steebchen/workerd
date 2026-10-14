@@ -66,6 +66,22 @@ worker (including any wait for the isolate lock) until the request and its `wait
 finished, measured on the monotonic clock in `RequestObserverWithTracer`. `wallTime - cpuTime` is
 the time the request spent waiting: on I/O, or on other requests holding the isolate thread.
 
+### Body sizes and content type in tail events
+
+Upstream tail events say nothing about how many bytes a request moved. This build adds, for HTTP
+requests to workers that have tail workers:
+
+- `TraceItem.event.request.bodySize`: bytes the worker read from the request body.
+- `TraceItem.event.response.bodySize`: bytes the worker wrote to the response body.
+- `TraceItem.event.response.contentType`: the response's `Content-Type` header.
+
+`RequestObserverWithTracer` wraps the request body stream and the response it hands to the worker
+and counts bytes as they are read and written, pumps included, so chunked uploads and streamed
+responses without a `Content-Length` are counted exactly. It hands the totals to the tracer next to
+`cpuTime` and `wallTime` when the request finishes. A request body the worker never reads counts
+as 0. Tests: `tailReportsStreamedBodySizes` and `tailReportsUnreadBodyAsZero` in
+`worker-loader-cpu-limit-test.js`, and the chunked upload in `ploy/smoke-test/run.sh`.
+
 ## Releasing
 
 1. Rebase `ploy/main` onto the upstream release tag (`git rebase v1.YYYYMMDD.N`) and push it. The

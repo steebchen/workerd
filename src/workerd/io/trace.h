@@ -620,6 +620,14 @@ struct FetchResponseInfo final {
   FetchResponseInfo clone() const;
 };
 
+// Ploy: the bytes an HTTP request actually read from its request body and wrote to its response
+// body (chunked and streamed bodies included), and the response's Content-Type.
+struct HttpBodySizes final {
+  uint64_t requestBodySize = 0;
+  uint64_t responseBodySize = 0;
+  kj::Maybe<kj::String> responseContentType;
+};
+
 // Describes an event published using the node:diagnostics_channel API
 struct DiagnosticChannelEvent final {
   explicit DiagnosticChannelEvent(
@@ -1088,6 +1096,7 @@ class Trace final: public kj::Refcounted {
 
   kj::Duration cpuTime;
   kj::Duration wallTime;
+  kj::Maybe<tracing::HttpBodySizes> httpBodySizes;
 
   bool truncated = false;
   bool exceededLogLimit = false;

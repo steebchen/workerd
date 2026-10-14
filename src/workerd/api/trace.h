@@ -270,6 +270,8 @@ class TraceItem::FetchEventInfo::Request final: public jsg::Object {
     kj::Array<tracing::FetchEventInfo::Header> headers;
     kj::String method;
     kj::String url;
+    // Ploy: bytes the request read from its body.
+    kj::Maybe<uint64_t> bodySize;
 
     Detail(jsg::Optional<jsg::V8Ref<v8::Object>> cf,
         kj::Array<tracing::FetchEventInfo::Header> headers,
@@ -298,6 +300,7 @@ class TraceItem::FetchEventInfo::Request final: public jsg::Object {
   jsg::Dict<kj::String, kj::String> getHeaders(jsg::Lock& js);
   kj::StringPtr getMethod();
   kj::String getUrl();
+  jsg::Optional<double> getBodySize();
 
   jsg::Ref<Request> getUnredacted(jsg::Lock& js);
 
@@ -306,6 +309,7 @@ class TraceItem::FetchEventInfo::Request final: public jsg::Object {
     JSG_LAZY_READONLY_INSTANCE_PROPERTY(headers, getHeaders);
     JSG_LAZY_READONLY_INSTANCE_PROPERTY(method, getMethod);
     JSG_LAZY_READONLY_INSTANCE_PROPERTY(url, getUrl);
+    JSG_LAZY_READONLY_INSTANCE_PROPERTY(bodySize, getBodySize);
 
     JSG_METHOD(getUnredacted);
   }
@@ -332,13 +336,20 @@ class TraceItem::FetchEventInfo::Response final: public jsg::Object {
   explicit Response(const Trace& trace, const tracing::FetchResponseInfo& responseInfo);
 
   uint16_t getStatus();
+  jsg::Optional<double> getBodySize();
+  jsg::Optional<kj::StringPtr> getContentType();
 
   JSG_RESOURCE_TYPE(Response) {
     JSG_LAZY_READONLY_INSTANCE_PROPERTY(status, getStatus);
+    JSG_LAZY_READONLY_INSTANCE_PROPERTY(bodySize, getBodySize);
+    JSG_LAZY_READONLY_INSTANCE_PROPERTY(contentType, getContentType);
   }
 
  private:
   uint16_t status;
+  // Ploy: bytes the worker wrote to the response body, and the response's Content-Type.
+  kj::Maybe<uint64_t> bodySize;
+  kj::Maybe<kj::String> contentType;
 };
 
 class TraceItem::JsRpcEventInfo final: public jsg::Object {

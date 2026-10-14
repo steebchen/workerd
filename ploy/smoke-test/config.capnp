@@ -6,7 +6,8 @@ const config :Workerd.Config = (
 const main :Workerd.Worker = (
   modules = [ (name = "main.js", esModule = embed "main.js") ],
   compatibilityDate = "2025-09-15",
-  bindings = [ (name = "loader", workerLoader = ()), (name = "tail", service = "tail") ]
+  bindings = [ (name = "loader", workerLoader = ()), (name = "tail", service = "tail") ],
+  tails = [ "tail" ]
 );
 const tail :Workerd.Worker = (
   modules = [ (name = "tail.js", esModule = embed "tail.js") ],

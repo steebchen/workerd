@@ -146,8 +146,12 @@ kj::Own<TraceItem::FetchEventInfo::Request::Detail> getFetchRequestDetail(
     };
   };
 
-  return kj::refcounted<TraceItem::FetchEventInfo::Request::Detail>(
+  auto detail = kj::refcounted<TraceItem::FetchEventInfo::Request::Detail>(
       getCf(), getHeaders(), kj::str(eventInfo.method), kj::str(eventInfo.url));
+  KJ_IF_SOME(sizes, trace.httpBodySizes) {
+    detail->bodySize = sizes.requestBodySize;
+  }
+  return detail;
 }
 
 kj::Maybe<TraceItem::EventInfo> getTraceEvent(jsg::Lock& js, const Trace& trace) {
@@ -407,6 +411,10 @@ kj::String TraceItem::FetchEventInfo::Request::getUrl() {
   return (redacted ? redactUrl(detail->url) : kj::str(detail->url));
 }
 
+jsg::Optional<double> TraceItem::FetchEventInfo::Request::getBodySize() {
+  return detail->bodySize.map([](uint64_t size) { return static_cast<double>(size); });
+}
+
 jsg::Ref<TraceItem::FetchEventInfo::Request> TraceItem::FetchEventInfo::Request::getUnredacted(
     jsg::Lock& js) {
   return js.alloc<Request>(*detail, false /* details are not redacted */);
@@ -414,10 +422,23 @@ jsg::Ref<TraceItem::FetchEventInfo::Request> TraceItem::FetchEventInfo::Request:
 
 TraceItem::FetchEventInfo::Response::Response(
     const Trace& trace, const tracing::FetchResponseInfo& responseInfo)
-    : status(responseInfo.statusCode) {}
+    : status(responseInfo.statusCode) {
+  KJ_IF_SOME(sizes, trace.httpBodySizes) {
+    bodySize = sizes.responseBodySize;
+    contentType = sizes.responseContentType.map([](auto& type) { return kj::str(type); });
+  }
+}
 
 uint16_t TraceItem::FetchEventInfo::Response::getStatus() {
   return status;
+}
+
+jsg::Optional<double> TraceItem::FetchEventInfo::Response::getBodySize() {
+  return bodySize.map([](uint64_t size) { return static_cast<double>(size); });
+}
+
+jsg::Optional<kj::StringPtr> TraceItem::FetchEventInfo::Response::getContentType() {
+  return contentType.map([](kj::String& type) -> kj::StringPtr { return type; });
 }
 
 TraceItem::JsRpcEventInfo::JsRpcEventInfo(

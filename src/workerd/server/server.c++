@@ -3122,6 +3122,134 @@ void Server::InspectorServiceIsolateRegistrar::registerIsolate(
 
 // =======================================================================================
 namespace {
+// Bytes an HTTP request read from its request body and wrote to its response body, plus the
+// response's Content-Type, for tail events. Refcounted because the stream wrappers that count
+// may be destroyed after the observer.
+struct HttpBodyCounts final: public kj::Refcounted {
+  uint64_t requestBodySize = 0;
+  uint64_t responseBodySize = 0;
+  kj::Maybe<kj::String> responseContentType;
+};
+
+// Counts the bytes actually read from a request body, however the worker consumes it (reads,
+// pumps, chunked or not).
+class CountingInputStream final: public kj::AsyncInputStream {
+ public:
+  CountingInputStream(kj::AsyncInputStream& inner, kj::Own<HttpBodyCounts> counts)
+      : inner(inner),
+        counts(kj::mv(counts)) {}
+
+  kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
+    return inner.tryRead(buffer, minBytes, maxBytes)
+        .then([counts = kj::addRef(*counts)](size_t n) mutable {
+      counts->requestBodySize += n;
+      return n;
+    });
+  }
+
+  kj::Maybe<size_t> tryReadSync(kj::ArrayPtr<kj::byte> buffer, size_t minBytes) override {
+    auto result = inner.tryReadSync(buffer, minBytes);
+    KJ_IF_SOME(n, result) {
+      counts->requestBodySize += n;
+    }
+    return result;
+  }
+
+  kj::Maybe<uint64_t> tryGetLength() override {
+    return inner.tryGetLength();
+  }
+
+  kj::Promise<uint64_t> pumpTo(kj::AsyncOutputStream& output, uint64_t amount) override {
+    return inner.pumpTo(output, amount).then([counts = kj::addRef(*counts)](uint64_t n) mutable {
+      counts->requestBodySize += n;
+      return n;
+    });
+  }
+
+ private:
+  kj::AsyncInputStream& inner;
+  kj::Own<HttpBodyCounts> counts;
+};
+
+// Counts the bytes actually written to a response body, including streamed responses that have
+// no Content-Length.
+class CountingOutputStream final: public kj::AsyncOutputStream {
+ public:
+  CountingOutputStream(kj::Own<kj::AsyncOutputStream> inner, kj::Own<HttpBodyCounts> counts)
+      : inner(kj::mv(inner)),
+        counts(kj::mv(counts)) {}
+
+  kj::Promise<void> write(kj::ArrayPtr<const kj::byte> buffer) override {
+    return inner->write(buffer).then([counts = kj::addRef(*counts), n = buffer.size()]() mutable {
+      counts->responseBodySize += n;
+    });
+  }
+
+  kj::Promise<void> write(kj::ArrayPtr<const kj::ArrayPtr<const kj::byte>> pieces) override {
+    uint64_t n = 0;
+    for (auto& piece: pieces) n += piece.size();
+    return inner->write(pieces).then(
+        [counts = kj::addRef(*counts), n]() mutable { counts->responseBodySize += n; });
+  }
+
+  bool tryWriteSync(kj::ArrayPtr<const kj::byte> buffer) override {
+    if (!inner->tryWriteSync(buffer)) return false;
+    counts->responseBodySize += buffer.size();
+    return true;
+  }
+
+  bool tryWriteSync(kj::ArrayPtr<const kj::ArrayPtr<const kj::byte>> pieces) override {
+    if (!inner->tryWriteSync(pieces)) return false;
+    for (auto& piece: pieces) counts->responseBodySize += piece.size();
+    return true;
+  }
+
+  kj::Maybe<kj::Promise<uint64_t>> tryPumpFrom(
+      kj::AsyncInputStream& input, uint64_t amount) override {
+    return inner->tryPumpFrom(input, amount).map([&](kj::Promise<uint64_t>& pump) {
+      return pump.then([counts = kj::addRef(*counts)](uint64_t n) mutable {
+        counts->responseBodySize += n;
+        return n;
+      });
+    });
+  }
+
+  kj::Promise<void> whenWriteDisconnected() override {
+    return inner->whenWriteDisconnected();
+  }
+
+ private:
+  kj::Own<kj::AsyncOutputStream> inner;
+  kj::Own<HttpBodyCounts> counts;
+};
+
+class CountingResponse final: public kj::HttpService::Response {
+ public:
+  CountingResponse(kj::HttpService::Response& inner, kj::Own<HttpBodyCounts> counts)
+      : inner(inner),
+        counts(kj::mv(counts)) {}
+
+  kj::Own<kj::AsyncOutputStream> send(uint statusCode,
+      kj::StringPtr statusText,
+      const kj::HttpHeaders& headers,
+      kj::Maybe<uint64_t> expectedBodySize) override {
+    counts->responseContentType =
+        headers.get(kj::HttpHeaderId::CONTENT_TYPE).map([](kj::StringPtr type) {
+      return kj::str(type);
+    });
+    return kj::heap<CountingOutputStream>(
+        inner.send(statusCode, statusText, headers, expectedBodySize), kj::addRef(*counts));
+  }
+
+  kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders& headers) override {
+    return inner.acceptWebSocket(headers);
+  }
+
+ private:
+  kj::HttpService::Response& inner;
+  kj::Own<HttpBodyCounts> counts;
+};
+
 class RequestObserverWithTracer final: public RequestObserver, public WorkerInterface {
  public:
   RequestObserverWithTracer(kj::Maybe<kj::Rc<WorkerTracer>> tracer, kj::TaskSet& waitUntilTasks)
@@ -3138,6 +3266,10 @@ class RequestObserverWithTracer final: public RequestObserver, public WorkerInte
       // Wall time runs from when the request reached this worker (including any wait for the
       // isolate lock) until the request and its waitUntil() tasks finished.
       auto wallTime = kj::systemPreciseMonotonicClock().now() - start;
+      KJ_IF_SOME(counts, bodyCounts) {
+        t->setHttpBodySizes(
+            counts->requestBodySize, counts->responseBodySize, kj::mv(counts->responseContentType));
+      }
       t->setOutcome(outcome, cpuTime, wallTime);
     }
   }
@@ -3167,8 +3299,12 @@ class RequestObserverWithTracer final: public RequestObserver, public WorkerInte
       const kj::HttpHeaders& headers,
       kj::AsyncInputStream& requestBody,
       kj::HttpService::Response& response) override {
+    auto counts = kj::refcounted<HttpBodyCounts>();
+    CountingInputStream countedBody(requestBody, kj::addRef(*counts));
+    CountingResponse countedResponse(response, kj::addRef(*counts));
+    bodyCounts = kj::mv(counts);
     try {
-      co_await KJ_ASSERT_NONNULL(inner).request(method, url, headers, requestBody, response);
+      co_await KJ_ASSERT_NONNULL(inner).request(method, url, headers, countedBody, countedResponse);
     } catch (...) {
       auto exception = kj::getCaughtExceptionAsKj();
       reportFailure(exception);
@@ -3269,6 +3405,7 @@ class RequestObserverWithTracer final: public RequestObserver, public WorkerInte
   EventOutcome outcome = EventOutcome::OK;
   kj::Duration cpuTime = 0 * kj::MILLISECONDS;
   kj::TimePoint start;
+  kj::Maybe<kj::Own<HttpBodyCounts>> bodyCounts;
 };
 
 class SequentialSpanSubmitter final: public SpanSubmitter {

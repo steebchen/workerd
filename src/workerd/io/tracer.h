@@ -207,6 +207,10 @@ class WorkerTracer final: public BaseTracer {
       tracing::EventInfo&& info);
 
   void setOutcome(EventOutcome outcome, kj::Duration cpuTime, kj::Duration wallTime) override;
+  // Ploy: record what an HTTP request transferred, for tail events. Called before setOutcome().
+  void setHttpBodySizes(uint64_t requestBodySize,
+      uint64_t responseBodySize,
+      kj::Maybe<kj::String> responseContentType);
   virtual void recordTimestamp(kj::Date timestamp) override;
 
   // Set a worker-level tag/attribute to be provided in the onset event.
