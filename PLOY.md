@@ -25,6 +25,26 @@ await worker.getEntrypoint(undefined, { limits: { cpuMs: 1000 } }).fetch(request
   `src/workerd/api/tests/worker-loader-cpu-limit-test.js`, plus `ploy/smoke-test/run.sh`, which the
   release workflow runs against the built binary.
 
+### CPU limit on dynamic worker startup
+
+`limits.cpuMs` only covers requests. A dynamic worker's top-level code runs when the Worker Loader
+builds the isolate, outside any request, so a tenant that loops at the top level would still hold
+the thread. This build adds `WorkerCode.limits.startupCpuMs`:
+
+```js
+const worker = env.loader.get(id, () => ({ ...code, limits: { startupCpuMs: 2000 } }));
+```
+
+- Covers module compilation, top-level evaluation and the evaluation of dynamically-imported
+  modules (`enterStartupJs`, `enterStartupPython`, `enterDynamicImportJs`), measured on the same
+  per-thread CPU clock and enforced by the same watchdog as `cpuMs`.
+- Once spent, the worker fails to load with `Worker exceeded CPU time limit during startup.`;
+  requests to it fail with that error, and the process keeps serving other workers. A dynamic import
+  that runs out fails that import only.
+- Ignored on `getEntrypoint()` limits; it is a property of the worker's code.
+- Implementation: `enterStartupCpuLimit()` in `src/workerd/server/cpu-limit-enforcer.c++`, used by
+  `NullIsolateLimitEnforcer` in `server.c++`.
+
 ### CPU time in tail events
 
 Upstream reports `cpuTime: 0` for every tail event (`RequestObserverWithTracer` hard-codes it).

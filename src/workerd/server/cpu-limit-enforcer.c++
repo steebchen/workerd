@@ -291,4 +291,30 @@ kj::Own<LimitEnforcer> newCpuLimitEnforcer(kj::Maybe<kj::Duration> limit) {
   return kj::refcounted<CpuLimitEnforcer>(limit);
 }
 
+kj::Own<void> enterStartupCpuLimit(jsg::Lock& lock,
+    kj::Maybe<kj::Duration> limit,
+    kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime) {
+  KJ_IF_SOME(l, limit) {
+    auto start = threadCpuNow();
+    auto id = CpuWatchdog::get().arm(lock.v8Isolate, start, start + l);
+    return kj::heap(kj::defer([isolate = lock.v8Isolate, id, start, &limitErrorOrTime]() {
+      bool fired = CpuWatchdog::get().disarm(id);
+      if (fired) {
+        // A termination V8 is already unwinding is left for the caller to observe through its
+        // v8::TryCatch (dynamic imports assert on it); V8 clears it once no JavaScript is left on
+        // the stack. Only a termination V8 has not acted on yet is cleared here, so it cannot hit
+        // whatever runs next.
+        if (!isolate->IsExecutionTerminating()) {
+          isolate->CancelTerminateExecution();
+        }
+        limitErrorOrTime =
+            JSG_KJ_EXCEPTION(OVERLOADED, Error, "Worker exceeded CPU time limit during startup.");
+      } else KJ_IF_SOME(time, limitErrorOrTime.tryGet<kj::Duration>()) {
+        time += threadCpuNow() - start;
+      }
+    }));
+  }
+  return {};
+}
+
 }  // namespace workerd::server

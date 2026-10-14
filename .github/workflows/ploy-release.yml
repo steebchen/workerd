@@ -1,7 +1,8 @@
 # Builds Ploy's workerd (upstream release + Ploy patches) and runs the Worker Loader tests and a
-# smoke test on every push to `ploy/main`. Pushing a tag `v<upstream>-ploy.<n>` on a commit whose
-# `ploy/main` build succeeded publishes that build's binaries as a GitHub release. The tag run does
-# not rebuild: tag refs cannot read the branch's Bazel cache, so a rebuild would be cold.
+# smoke test on every push to `ploy/main` and every pull request into it. Pushing a tag
+# `v<upstream>-ploy.<n>` on a commit whose `ploy/main` build succeeded publishes that build's
+# binaries as a GitHub release. The tag run does not rebuild: tag refs cannot read the branch's
+# Bazel cache, so a rebuild would be cold.
 #
 # Runs on standard GitHub runners without Cloudflare's remote cache, so a cold build is slow. The
 # Bazel disk cache is saved even when the build times out, so re-running the workflow resumes
@@ -14,6 +15,10 @@ on:
       - ploy/main
     tags:
       - 'v*-ploy.*'
+  # Pull requests into ploy/main build and test too; their runs restore ploy/main's Bazel cache.
+  pull_request:
+    branches:
+      - ploy/main
   workflow_dispatch:
 
 permissions:

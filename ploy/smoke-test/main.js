@@ -17,6 +17,20 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === "/ping") return new Response("pong");
     if (url.pathname === "/tail-times") return env.tail.fetch("http://tail/");
+    if (url.pathname === "/startup-spin") {
+      const spinning = env.loader.get("startup-spin", () => ({
+        compatibilityDate: "2025-09-15",
+        mainModule: "tenant.js",
+        modules: { "tenant.js": "for (;;) {}\n" + TENANT },
+        globalOutbound: null,
+        limits: { startupCpuMs: 200 },
+      }));
+      try {
+        return await spinning.getEntrypoint().fetch(new Request("http://tenant/"));
+      } catch (error) {
+        return new Response("tenant failed: " + error.message, { status: 503 });
+      }
+    }
     const cpuMs = url.searchParams.get("cpuMs");
     const worker = env.loader.get("tenant", () => ({
       compatibilityDate: "2025-09-15",

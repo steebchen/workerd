@@ -550,11 +550,15 @@ class IoChannelFactory: public virtual kj::Refcounted {
 struct ResourceLimits {
   jsg::Optional<uint32_t> cpuMs;
   jsg::Optional<uint32_t> subRequests;
+  // CPU time the worker's startup (top-level module evaluation) may spend, and each
+  // dynamically-imported module's evaluation. Only read from `WorkerCode.limits`; enforced by
+  // workerd's server for dynamically-loaded workers.
+  jsg::Optional<uint32_t> startupCpuMs;
 
-  JSG_STRUCT(cpuMs, subRequests);
+  JSG_STRUCT(cpuMs, subRequests, startupCpuMs);
 
   ResourceLimits clone() const {
-    return {cpuMs, subRequests};
+    return {cpuMs, subRequests, startupCpuMs};
   }
 };
 

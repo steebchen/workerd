@@ -1,6 +1,7 @@
 #!/bin/sh
 # Usage: run.sh <workerd binary>. Runs a Ploy-like main worker that loads a tenant through the
-# Worker Loader and checks that limits.cpuMs cuts off runaway tenants without stalling the process.
+# Worker Loader and checks that limits.cpuMs and limits.startupCpuMs cut off runaway tenants without
+# stalling the process.
 set -u
 BIN=$1
 $BIN serve --experimental "$(dirname "$0")/config.capnp" >/tmp/wd.log 2>&1 &
@@ -41,6 +42,9 @@ fi
 echo "     tail cpuTime ${cpu_ms}ms wallTime ${wall_ms}ms for a request that took ${burn_ms}ms"
 [ "$cpu_ms" -ge $((burn_ms / 3)) ] && [ "$cpu_ms" -le $((burn_ms * 2 + 50)) ] && echo "PASS tail reports request CPU time" || { echo "FAIL tail cpuTime ${cpu_ms}ms, request took ${burn_ms}ms"; fail=1; }
 [ "$wall_ms" -ge "$cpu_ms" ] && [ "$wall_ms" -ge $((burn_ms / 2)) ] && [ "$wall_ms" -le $((burn_ms * 2 + 500)) ] && echo "PASS tail reports request wall time" || { echo "FAIL tail wallTime ${wall_ms}ms, cpuTime ${cpu_ms}ms, request took ${burn_ms}ms"; fail=1; }
+
+r=$(t "/startup-spin"); check "startup loop is cut off" "$(echo $r | cut -d' ' -f1) $(grep -o 'exceeded CPU time limit during startup' /tmp/body)" "503 exceeded CPU time limit during startup"
+echo "     startup-spin request took $(echo $r | cut -d' ' -f2)s"
 
 r=$(t "/ping"); check "main worker unaffected" "$(echo $r | cut -d' ' -f1) $(cat /tmp/body)" "200 pong"
 kill $PID
