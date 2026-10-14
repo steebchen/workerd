@@ -1283,6 +1283,13 @@ wd_test(
 )
 
 wd_test(
+    size = "large",
+    src = "worker-loader-eviction-test.wd-test",
+    args = ["--experimental"],
+    data = ["worker-loader-eviction-test.js"],
+)
+
+wd_test(
     size = "enormous",
     src = "worker-loader-test.wd-test",
     args = ["--experimental"],

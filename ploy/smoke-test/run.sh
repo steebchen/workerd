@@ -1,7 +1,7 @@
 #!/bin/sh
 # Usage: run.sh <workerd binary>. Runs a Ploy-like main worker that loads a tenant through the
 # Worker Loader and checks that limits.cpuMs and limits.startupCpuMs cut off runaway tenants without
-# stalling the process.
+# stalling the process, and that maxCachedMemoryBytes evicts least recently used tenants.
 set -u
 BIN=$1
 $BIN serve --experimental "$(dirname "$0")/config.capnp" >/tmp/wd.log 2>&1 &
@@ -45,6 +45,19 @@ echo "     tail cpuTime ${cpu_ms}ms wallTime ${wall_ms}ms for a request that too
 
 r=$(t "/startup-spin"); check "startup loop is cut off" "$(echo $r | cut -d' ' -f1) $(grep -o 'exceeded CPU time limit during startup' /tmp/body)" "503 exceeded CPU time limit during startup"
 echo "     startup-spin request took $(echo $r | cut -d' ' -f2)s"
+
+# boundedLoader caches 128 MiB of tenants: two 44 MiB tenants fit, a third evicts the least recently
+# used one, which then reloads on its next request.
+big() { t "/big?mib=44&name=$1" >/dev/null; cat /tmp/body; }
+big a >/dev/null; big b >/dev/null; big a >/dev/null; big c >/dev/null
+check "cached tenant is reused" "$(big a)" "a loads=1"
+check "recent tenant stays cached" "$(big c)" "c loads=1"
+check "least recently used tenant is evicted" "$(big b)" "b loads=2"
+rss_before=$(ps -o rss= -p $PID | tr -d ' ')
+i=0; while [ $i -lt 20 ]; do big "n$i" >/dev/null; i=$((i + 1)); done
+rss_after=$(ps -o rss= -p $PID | tr -d ' ')
+echo "     RSS ${rss_before}KiB before, ${rss_after}KiB after loading 20 more 44 MiB tenants (880 MiB uncapped)"
+[ $((rss_after - rss_before)) -lt $((440 * 1024)) ] && echo "PASS memory stays bounded" || { echo "FAIL RSS grew by $(((rss_after - rss_before) / 1024))MiB"; fail=1; }
 
 r=$(t "/ping"); check "main worker unaffected" "$(echo $r | cut -d' ' -f1) $(cat /tmp/body)" "200 pong"
 kill $PID

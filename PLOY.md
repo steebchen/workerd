@@ -66,6 +66,27 @@ worker (including any wait for the isolate lock) until the request and its `wait
 finished, measured on the monotonic clock in `RequestObserverWithTracer`. `wallTime - cpuTime` is
 the time the request spent waiting: on I/O, or on other requests holding the isolate thread.
 
+### Memory-bounded Worker Loader cache
+
+Upstream keeps every named Worker loaded through a Worker Loader for the life of the process, so a
+host that serves many tenants (or many deployments of one tenant) only grows. This build adds a
+soft memory budget per loader binding:
+
+```capnp
+(name = "loader", workerLoader = (maxCachedMemoryBytes = 1073741824)),
+```
+
+- Each cached Worker is charged its isolate's V8 heap and external memory plus its retained source
+  and serialized `env`, re-measured when it finishes loading and after every request.
+- When the total exceeds the budget, the least recently used Workers are dropped from the cache. A
+  stub or request that still holds an evicted Worker keeps it alive until released; the next
+  `loader.get()` for that name calls the code callback again and loads a fresh isolate.
+- Zero (the default) keeps upstream's unbounded behavior. Bindings that share an `id` must use the
+  same budget. Unnamed (`loader.load()`) Workers are not cached and not counted.
+- Implementation: `WorkerLoaderNamespace` in `src/workerd/server/server.c++`. Tests:
+  `src/workerd/api/tests/worker-loader-eviction-test.js`, plus the eviction and RSS checks in
+  `ploy/smoke-test/run.sh`.
+
 ## Releasing
 
 1. Rebase `ploy/main` onto the upstream release tag (`git rebase v1.YYYYMMDD.N`) and push it. The
