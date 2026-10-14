@@ -5621,6 +5621,11 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
       TRACE_EVENT("workerd", "WorkerLoaderNamespace::evict", "namespace", namespaceName.cStr(),
           "deployment", name.cStr(), "memoryUsage", memoryUsage, "totalCachedMemory",
           totalCachedMemory, "maxCachedMemory", maxCachedMemoryBytes);
+      // WARNING so that it shows at the default log level: embedders size the budget from these.
+      KJ_LOG(WARNING,
+          kj::str("evicted dynamic Worker from loader cache; namespace = ", namespaceName,
+              "; name = ", name, "; memoryUsage = ", memoryUsage, "; totalCachedMemory = ",
+              totalCachedMemory, "; maxCachedMemory = ", maxCachedMemoryBytes));
       isolates.erase(name);
     }
   }
