@@ -27,4 +27,13 @@ namespace workerd::server {
 // default.
 kj::Own<LimitEnforcer> newCpuLimitEnforcer(kj::Maybe<kj::Duration> limit);
 
+// Scope for IsolateLimitEnforcer::enterStartupJs() and friends: caps the CPU time the enclosed
+// JavaScript (a worker's top-level module evaluation, or a dynamic import) may spend at `limit`.
+// Startup runs outside any request, so the per-request limit cannot cover it. When the scope is
+// dropped after the limit was hit, `limitErrorOrTime` holds "Worker exceeded CPU time limit during
+// startup."; otherwise the measured CPU time is added to it. No limit returns an empty scope.
+kj::Own<void> enterStartupCpuLimit(jsg::Lock& lock,
+    kj::Maybe<kj::Duration> limit,
+    kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime);
+
 }  // namespace workerd::server

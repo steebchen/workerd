@@ -24,6 +24,7 @@ const MAIN_MODULE = `
       for (;;) {}
     }
     burn(iterations) { return burn(iterations); }
+    async importDefault(specifier) { return (await import(specifier)).default; }
     async burnSlices(slices, iterations) {
       for (let i = 0; i < slices; i++) {
         burn(iterations);
@@ -163,6 +164,78 @@ export let noLimitByDefault = {
     assert.strictEqual(
       await worker.getEntrypoint().burnSlices(5, SLICE_ITERATIONS),
       'done'
+    );
+  },
+};
+
+const SPIN_MODULE = 'for (;;) {}\nexport default "unreachable";';
+
+function assertStartupCpuLimitError(e) {
+  assert.match(
+    String(e?.message ?? e),
+    /exceeded CPU time limit during startup/
+  );
+  return true;
+}
+
+// `limits.startupCpuMs` terminates top-level code that runs past its budget. Startup runs outside
+// any request, so the per-request limit cannot catch it.
+export let startupLoopIsTerminated = {
+  async test(ctrl, env) {
+    const worker = load(env, 'startupLoopIsTerminated', {
+      modules: { 'main.js': 'for (;;) {}\n' + MAIN_MODULE },
+      limits: { startupCpuMs: 50 },
+    });
+    const start = Date.now();
+    await assert.rejects(
+      limited(worker, 1000).ping(),
+      assertStartupCpuLimitError
+    );
+    assert.ok(Date.now() - start < 10_000, 'termination took too long');
+
+    // Other workers in the process keep loading and serving.
+    const healthy = load(env, 'startupLoopIsTerminatedHealthy', {
+      limits: { startupCpuMs: 50 },
+    });
+    assert.strictEqual(await healthy.getEntrypoint().ping(), 'pong');
+  },
+};
+
+// Startup work within the budget loads normally.
+export let startupWithinLimitLoads = {
+  async test(ctrl, env) {
+    const worker = load(env, 'startupWithinLimitLoads', {
+      modules: {
+        'main.js': `globalThis.startupResult = (${(n) => {
+          let x = 0;
+          for (let i = 0; i < n; i++) x = (x + i) % 7;
+          return x;
+        }})(1000);\n${MAIN_MODULE}`,
+      },
+      limits: { startupCpuMs: 60_000 },
+    });
+    assert.strictEqual(await worker.getEntrypoint().ping(), 'pong');
+  },
+};
+
+// Evaluating a dynamically-imported module is covered by the startup budget too.
+export let dynamicImportIsTerminated = {
+  async test(ctrl, env) {
+    const worker = load(env, 'dynamicImportIsTerminated', {
+      modules: {
+        'main.js': MAIN_MODULE,
+        'spin.js': SPIN_MODULE,
+        'ok.js': 'export default "loaded";',
+      },
+      limits: { startupCpuMs: 50 },
+    });
+    await assert.rejects(
+      worker.getEntrypoint().importDefault('./spin.js'),
+      /exceeded CPU time limit/
+    );
+    assert.strictEqual(
+      await worker.getEntrypoint().importDefault('./ok.js'),
+      'loaded'
     );
   },
 };

@@ -3337,9 +3337,13 @@ class SequentialSpanSubmitter final: public SpanSubmitter {
   kj::EntropySource& entropySource;
 };
 
-// IsolateLimitEnforcer that enforces no limits.
+// IsolateLimitEnforcer that enforces no limits, except an optional CPU limit on startup and dynamic
+// imports for dynamically-loaded workers (`WorkerCode.limits.startupCpuMs`).
 class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
  public:
+  explicit NullIsolateLimitEnforcer(kj::Maybe<kj::Duration> startupCpuLimit = kj::none)
+      : startupCpuLimit(startupCpuLimit) {}
+
   v8::Isolate::CreateParams getCreateParams() override {
     return {};
   }
@@ -3360,18 +3364,18 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   }
 
   kj::Own<void> enterStartupJs(
-      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>&) const override {
-    return {};
+      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime) const override {
+    return enterStartupCpuLimit(lock, startupCpuLimit, limitErrorOrTime);
   }
 
   kj::Own<void> enterStartupPython(
-      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>&) const override {
-    return {};
+      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime) const override {
+    return enterStartupCpuLimit(lock, startupCpuLimit, limitErrorOrTime);
   }
 
   kj::Own<void> enterDynamicImportJs(
-      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>&) const override {
-    return {};
+      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime) const override {
+    return enterStartupCpuLimit(lock, startupCpuLimit, limitErrorOrTime);
   }
 
   kj::Own<void> enterLoggingJs(
@@ -3406,6 +3410,7 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   }
 
  private:
+  kj::Maybe<kj::Duration> startupCpuLimit;
   TrackedWasmInstanceList trackedWasmInstances;
 };
 
@@ -4119,8 +4124,7 @@ class Server::WorkerService final: public Service,
     }
 
     return newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName.clone(),
-        kj::mv(props), kj::mv(actor), makeLimitEnforcer(cpuLimitMs),
-        {},  // ioContextDependency
+        kj::mv(props), kj::mv(actor), makeLimitEnforcer(cpuLimitMs), {},  // ioContextDependency
         addRefToThis(), kj::mv(observer), waitUntilTasks,
         true,                  // tunnelExceptions
         kj::mv(workerTracer),  // workerTracer
@@ -5324,6 +5328,9 @@ struct Server::WorkerDef {
 
   // ServiceDesignator for the access binding worker. Resolved during linkCallback.
   kj::Maybe<config::ServiceDesignator::Reader> accessBindingServiceDesignator;
+
+  // CPU limit on startup and dynamic imports, from a dynamic worker's `limits.startupCpuMs`.
+  kj::Maybe<uint32_t> startupCpuLimitMs;
 };
 
 class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet::ErrorHandler {
@@ -5475,8 +5482,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
       KJ_IF_SOME(l, limits) {
         cpuLimitMs = l.cpuMs;
       }
-      return kj::rc<SubrequestChannelImpl>(
-          addRefToThis(), kj::mv(name), kj::mv(props), cpuLimitMs);
+      return kj::rc<SubrequestChannelImpl>(addRefToThis(), kj::mv(name), kj::mv(props), cpuLimitMs);
     }
 
     kj::Rc<IoChannelFactory::ActorClassChannel> getActorClassResolved(
@@ -5594,6 +5600,10 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
         .abortIsolateCallback = kj::Function<void()>([this]() { onAbortIsolate(); }),
         // clang-format on
       };
+
+      KJ_IF_SOME(limits, source.limits) {
+        def.startupCpuLimitMs = limits.startupCpuMs;
+      }
 
       DynamicErrorReporter errorReporter;
 
@@ -5946,7 +5956,8 @@ kj::Own<Worker::Isolate> Server::makeWorkerIsolate(kj::StringPtr name,
     kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
   auto jsgobserver = kj::atomicRefcounted<JsgIsolateObserver>();
   auto observer = kj::atomicRefcounted<IsolateObserver>();
-  auto limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
+  auto limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>(
+      def.startupCpuLimitMs.map([](uint32_t ms) { return ms * kj::MILLISECONDS; }));
   auto isolateGroup = jsg::newIsolateGroup();
 
   kj::Array<Worker::Api::InboundListener> listeners;
