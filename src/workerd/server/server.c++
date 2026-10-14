@@ -3206,12 +3206,13 @@ class CountingOutputStream final: public kj::AsyncOutputStream {
 
   kj::Maybe<kj::Promise<uint64_t>> tryPumpFrom(
       kj::AsyncInputStream& input, uint64_t amount) override {
-    return inner->tryPumpFrom(input, amount).map([&](kj::Promise<uint64_t>& pump) {
-      return pump.then([counts = kj::addRef(*counts)](uint64_t n) mutable {
+    KJ_IF_SOME(pump, inner->tryPumpFrom(input, amount)) {
+      return kj::mv(pump).then([counts = kj::addRef(*counts)](uint64_t n) mutable {
         counts->responseBodySize += n;
         return n;
       });
-    });
+    }
+    return kj::none;
   }
 
   kj::Promise<void> whenWriteDisconnected() override {
