@@ -149,6 +149,11 @@ class WorkerLoader: public jsg::Object {
   }
 
  private:
+  struct ExtractedSource {
+    Worker::Script::Source source;
+    size_t retainedSize;
+  };
+
   uint channel;
   CompatibilityDateValidation compatDateValidation;
 
@@ -157,7 +162,7 @@ class WorkerLoader: public jsg::Object {
       CompatibilityDateValidation compatDateValidation,
       WorkerCode code);
 
-  static Worker::Script::Source extractSource(jsg::Lock& js, WorkerCode& code);
+  static ExtractedSource extractSource(jsg::Lock& js, WorkerCode& code);
   static kj::Own<CompatibilityFlags::Reader> extractCompatFlags(
       jsg::Lock& js, WorkerCode& code, CompatibilityDateValidation compatDateValidation);
 

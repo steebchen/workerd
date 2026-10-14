@@ -4829,6 +4829,21 @@ class Server::WorkerService final: public Service,
       kj::Maybe<kj::String> name,
       kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource) override;
 
+ public:
+  size_t getCurrentMemoryUsage() const {
+    return worker->runInLockScope(
+        Worker::Lock::TakeSynchronously(kj::none), [](Worker::Lock& lock) {
+      auto* isolate = lock.getIsolate();
+      auto externalMemory = isolate->GetExternalMemory();
+      auto heapMemory = isolate->GetHeapSize();
+      auto positiveExternalMemory = externalMemory > 0 ? static_cast<size_t>(externalMemory) : 0u;
+      size_t maxMemory = kj::maxValue;
+      return positiveExternalMemory > maxMemory - heapMemory ? maxMemory
+                                                             : heapMemory + positiveExternalMemory;
+    });
+  }
+
+ private:
   kj::Network& getWorkerdDebugPortNetwork() override {
     auto& channels =
         KJ_REQUIRE_NONNULL(ioChannels.tryGet<LinkedIoChannels>(), "link() has not been called");
@@ -4991,6 +5006,7 @@ struct FutureActorClassChannel {
 struct FutureWorkerLoaderChannel {
   kj::String name;  // for error logging, not necessarily unique
   kj::Maybe<kj::String> id;
+  uint64_t maxCachedMemoryBytes;
 };
 
 static kj::Maybe<WorkerdApi::Global> createBinding(kj::StringPtr workerName,
@@ -5362,6 +5378,7 @@ static kj::Maybe<WorkerdApi::Global> createBinding(kj::StringPtr workerName,
       auto loaderConf = binding.getWorkerLoader();
 
       FutureWorkerLoaderChannel channel;
+      channel.maxCachedMemoryBytes = loaderConf.getMaxCachedMemoryBytes();
       if (loaderConf.hasId()) {
         channel.name = kj::str(loaderConf.getId());
         channel.id = kj::str(channel.name);
@@ -5473,72 +5490,143 @@ struct Server::WorkerDef {
 
 class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet::ErrorHandler {
  public:
-  WorkerLoaderNamespace(Server& server, kj::String namespaceName)
+  WorkerLoaderNamespace(Server& server, kj::String namespaceName, uint64_t maxCachedMemoryBytes)
       : server(server),
         namespaceName(kj::mv(namespaceName)),
+        maxCachedMemoryBytes(maxCachedMemoryBytes),
         startupTasks(*this) {}
 
+  uint64_t getMaxCachedMemoryBytes() const {
+    return maxCachedMemoryBytes;
+  }
+
   void unlink() {
+    unlinked = true;
     for (auto& isolate: isolates) {
-      isolate.value->unlink();
+      isolate.value.stub->unlink();
     }
   }
 
   kj::Own<WorkerStubChannel> loadIsolate(
       kj::Maybe<kj::String> name, kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource) {
     KJ_IF_SOME(n, name) {
-      return isolates
-          .findOrCreate(n,
-              [&]() -> decltype(isolates)::Entry {
-        // This name isn't actually used in any maps nor is it ever revealed back to the app, but it
-        // may be used in error logs.
-        auto isolateName = kj::str(namespaceName, ':', n);
+      KJ_IF_SOME(existing, isolates.find(n)) {
+        existing.lastUsed = stepLiveliness();
+        return existing.stub.addRef().toOwn();
+      }
 
-        // On abort, remove the entry from this namespace's isolates map so
-        // subsequent loadIsolate() calls with the same name will create a fresh
-        // isolate.
-        kj::Function<void()> onAborted = [this, mapKey = kj::str(n)]() { removeIsolate(mapKey); };
-
-        return {.key = kj::mv(n),
-          .value = kj::rc<WorkerStubImpl>(
-              server, kj::mv(isolateName), kj::mv(onAborted), kj::mv(fetchSource))};
-      })
-          .addRef()
-          .toOwn();
+      // This name isn't actually used in any maps nor is it ever revealed back to the app, but it
+      // may be used in error logs.
+      auto isolateName = kj::str(namespaceName, ':', n);
+      auto mapKey = kj::str(n);
+      auto stub = kj::rc<WorkerStubImpl>(
+          *this, server, kj::mv(isolateName), kj::str(mapKey), kj::mv(fetchSource));
+      auto result = stub.addRef().toOwn();
+      isolates.insert(kj::mv(mapKey),
+          CachedIsolate{.stub = stub.addRef(), .lastUsed = stepLiveliness(), .memoryUsage = 0});
+      retainWhileStarting(stub);
+      return result;
     } else {
       auto isolateName = kj::str(namespaceName, ":dynamic:", randomUUID(server.entropySource));
       auto stub =
-          kj::rc<WorkerStubImpl>(server, kj::mv(isolateName), kj::none, kj::mv(fetchSource));
+          kj::rc<WorkerStubImpl>(*this, server, kj::mv(isolateName), kj::none, kj::mv(fetchSource));
       // Unnamed workers have no entry in the isolates map, so the JS-side
       // IoOwn would be the sole owner. Retain an extra ref so that GC of the
       // JS handle during the getCode re-entry callback cannot destroy the
       // object while its start() coroutine is still running. The extra ref
       // is held in a task on the namespace (NOT on the WorkerStubImpl itself)
       // so that when the task completes and drops the ref, the destruction
-      // does not re-enter a firing Event. The named-load path is safe because
-      // the isolates map already holds an additional kj::Rc.
-      auto selfRef = stub.addRef();
-      startupTasks.add(
-          stub->whenStartupDone().then([prevent = kj::mv(selfRef)]() { /* prevent dropped here */ },
-              [](kj::Exception&&) { /* startup failed; prevent dropped here */ }));
+      // does not re-enter a firing Event.
+      retainWhileStarting(stub);
       return kj::mv(stub).toOwn();
     }
-  }
-
-  void removeIsolate(kj::StringPtr name) {
-    // This is called by abortIsolate()
-    isolates.erase(name);
   }
 
  private:
   Server& server;
   kj::String namespaceName;
+  uint64_t maxCachedMemoryBytes;
 
   class WorkerStubImpl;
-  kj::HashMap<kj::String, kj::Rc<WorkerStubImpl>> isolates;
+  struct CachedIsolate {
+    kj::Rc<WorkerStubImpl> stub;
+    uint64_t lastUsed;
+    size_t memoryUsage;
+  };
+  kj::HashMap<kj::String, CachedIsolate> isolates;
+  uint64_t nextLiveliness = 0;
+  uint64_t totalCachedMemory = 0;
+  bool unlinked = false;
 
-  // Holds tasks that keep unnamed WorkerStubImpl instances alive while their
-  // start() coroutines are running. See the unnamed branch of loadIsolate().
+  void retainWhileStarting(kj::Rc<WorkerStubImpl>& stub);
+
+  uint64_t stepLiveliness() {
+    return nextLiveliness++;
+  }
+
+  void touchIsolate(kj::StringPtr name, WorkerStubImpl& stub) {
+    if (unlinked) return;
+    KJ_IF_SOME(entry, isolates.find(name)) {
+      if (&*entry.stub == &stub) {
+        entry.lastUsed = stepLiveliness();
+      }
+    }
+  }
+
+  void updateMemoryUsage(kj::StringPtr name, WorkerStubImpl& stub, size_t memoryUsage) {
+    if (unlinked) return;
+    KJ_IF_SOME(entry, isolates.find(name)) {
+      if (&*entry.stub != &stub) return;
+
+      KJ_ASSERT(totalCachedMemory >= entry.memoryUsage);
+      totalCachedMemory -= entry.memoryUsage;
+      entry.memoryUsage = memoryUsage;
+      uint64_t maxMemory = kj::maxValue;
+      if (memoryUsage > maxMemory - totalCachedMemory) {
+        totalCachedMemory = kj::maxValue;
+      } else {
+        totalCachedMemory += memoryUsage;
+      }
+      evictIfNeeded();
+    }
+  }
+
+  void removeIsolate(kj::StringPtr name, WorkerStubImpl& stub) {
+    // This is called by abortIsolate(). Check identity because an evicted stub may outlive the
+    // cache entry and a newer isolate may have since been loaded under the same name.
+    KJ_IF_SOME(entry, isolates.find(name)) {
+      if (&*entry.stub == &stub) {
+        KJ_ASSERT(totalCachedMemory >= entry.memoryUsage);
+        totalCachedMemory -= entry.memoryUsage;
+        isolates.erase(name);
+      }
+    }
+  }
+
+  void evictIfNeeded() {
+    if (maxCachedMemoryBytes == 0) return;
+
+    while (totalCachedMemory > maxCachedMemoryBytes && isolates.size() > 0) {
+      auto* oldest = &*isolates.begin();
+      for (auto& entry: isolates) {
+        if (entry.value.lastUsed < oldest->value.lastUsed) {
+          oldest = &entry;
+        }
+      }
+
+      auto name = kj::str(oldest->key);
+      auto memoryUsage = oldest->value.memoryUsage;
+      KJ_ASSERT(totalCachedMemory >= memoryUsage);
+      totalCachedMemory -= memoryUsage;
+      TRACE_EVENT("workerd", "WorkerLoaderNamespace::evict", "namespace", namespaceName.cStr(),
+          "deployment", name.cStr(), "memoryUsage", memoryUsage, "totalCachedMemory",
+          totalCachedMemory, "maxCachedMemory", maxCachedMemoryBytes);
+      isolates.erase(name);
+    }
+  }
+
+  // Holds tasks that keep WorkerStubImpl instances alive while their start() coroutines are
+  // running. A named Worker may be evicted as soon as startup reports its initial memory usage.
   kj::TaskSet startupTasks;
 
   void taskFailed(kj::Exception&& exception) override {
@@ -5576,11 +5664,13 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
 
   class WorkerStubImpl final: public WorkerStubChannel {
    public:
-    WorkerStubImpl(Server& server,
+    WorkerStubImpl(WorkerLoaderNamespace& owner,
+        Server& server,
         kj::String isolateName,
-        kj::Maybe<kj::Function<void()>> onAborted,
+        kj::Maybe<kj::String> cacheKey,
         kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource)
-        : onAborted(kj::mv(onAborted)),
+        : owner(owner),
+          cacheKey(kj::mv(cacheKey)),
           startupTask(start(server, kj::mv(isolateName), kj::mv(fetchSource)).fork()),
           cleanupTaskSet(server.tasks) {}
 
@@ -5629,22 +5719,49 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
     }
 
    private:
-    // Callback to remove the worker stub from the isolates map. None for
-    // unnamed dynamic isolates.
-    kj::Maybe<kj::Function<void()>> onAborted;
+    WorkerLoaderNamespace& owner;
+
+    // Name in the owner's cache. None for unnamed dynamic isolates.
+    kj::Maybe<kj::String> cacheKey;
 
     kj::Maybe<kj::Rc<WorkerService>> service;  // null if still starting up
     kj::ForkedPromise<void> startupTask;       // resolves when `service` is non-null
+    size_t retainedSourceSize = 0;
 
     kj::TaskSet& cleanupTaskSet;
     bool unlinked = false;
 
     void onAbortIsolate() {
-      KJ_IF_SOME(cb, onAborted) {
-        auto callback = kj::mv(cb);
-        onAborted = kj::none;
-        callback();
+      KJ_IF_SOME(key, cacheKey) {
+        owner.removeIsolate(key, *this);
+        cacheKey = kj::none;
       }
+    }
+
+    void touchCacheEntry() {
+      KJ_IF_SOME(key, cacheKey) {
+        owner.touchIsolate(key, *this);
+      }
+    }
+
+    void updateCacheEntryMemory() {
+      KJ_IF_SOME(key, cacheKey) {
+        KJ_IF_SOME(s, service) {
+          auto isolateMemory = s->getCurrentMemoryUsage();
+          size_t totalMemory;
+          size_t maxMemory = kj::maxValue;
+          if (retainedSourceSize > maxMemory - isolateMemory) {
+            totalMemory = kj::maxValue;
+          } else {
+            totalMemory = isolateMemory + retainedSourceSize;
+          }
+          owner.updateMemoryUsage(key, *this, totalMemory);
+        }
+      }
+    }
+
+    void requestFinished() {
+      updateCacheEntryMemory();
     }
 
     kj::Promise<void> start(Server& server,
@@ -5652,6 +5769,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
         kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource) {
       auto source = co_await fetchSource();
       co_await source.ensureAllResolved();
+      retainedSourceSize = source.estimatedRetainedSize;
       static const kj::HashMap<kj::String, ActorConfig> EMPTY_ACTOR_CONFIGS;
 
       // Rewrite the capabilities in `env` in order to build the I/O channel table.
@@ -5757,6 +5875,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
       }
 
       this->service = kj::mv(service);
+      updateCacheEntryMemory();
     }
 
     class SubrequestChannelImpl final: public IoChannelFactory::SubrequestChannel {
@@ -5803,6 +5922,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
       kj::Maybe<kj::Rc<Service>> entrypointService;
 
       kj::Own<WorkerInterface> startRequestImpl(IoChannelFactory::SubrequestMetadata metadata) {
+        isolate->touchCacheEntry();
         if (metadata.cpuLimitMs == kj::none) {
           metadata.cpuLimitMs = cpuLimitMs;
         }
@@ -5821,7 +5941,10 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
           // because it was a temporary expression), the SubrequestChannelImpl is destroyed,
           // the WorkerStubImpl refcount drops to zero, unlink() clears the WorkerService's
           // LinkedIoChannels, and the child worker's IoContext crashes accessing them.
-          return ep->startRequest(kj::mv(metadata)).attach(kj::addRef(*this));
+          return ep->startRequest(kj::mv(metadata))
+              .attach(kj::addRef(*this), kj::defer([isolate = isolate.addRef()]() mutable {
+            isolate->requestFinished();
+          }));
         } else {
           KJ_IF_SOME(en, entrypointName) {
             JSG_FAIL_REQUIRE(Error, "Worker has no such entrypoint: ", en);
@@ -5884,7 +6007,11 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
 
       kj::Own<WorkerInterface> startRequest(
           IoChannelFactory::SubrequestMetadata metadata, kj::Own<Worker::Actor> actor) override {
-        return getInner().startRequest(kj::mv(metadata), kj::mv(actor));
+        isolate->touchCacheEntry();
+        return getInner()
+            .startRequest(kj::mv(metadata), kj::mv(actor))
+            .attach(
+                kj::defer([isolate = isolate.addRef()]() mutable { isolate->requestFinished(); }));
       }
 
      private:
@@ -5901,6 +6028,13 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
     };
   };
 };
+
+void Server::WorkerLoaderNamespace::retainWhileStarting(kj::Rc<WorkerStubImpl>& stub) {
+  auto selfRef = stub.addRef();
+  startupTasks.add(
+      stub->whenStartupDone().then([prevent = kj::mv(selfRef)]() { /* prevent dropped here */ },
+          [](kj::Exception&&) { /* startup failed; prevent dropped here */ }));
+}
 
 void Server::unlinkWorkerLoaders() {
   for (auto& loader: workerLoaderNamespaces) {
@@ -6591,18 +6725,24 @@ kj::Promise<kj::Rc<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr 
 
     result.streamingTails = KJ_MAP(tail, def.streamingTails) { return kj::mv(tail).lookup(*this); };
 
-    result.workerLoaders = KJ_MAP(il, def.workerLoaderChannels) {
+    result.workerLoaders = KJ_MAP(il, def.workerLoaderChannels) -> kj::Rc<WorkerLoaderNamespace> {
       KJ_IF_SOME(id, il.id) {
-        return workerLoaderNamespaces
-            .findOrCreate(id, [&]() -> decltype(workerLoaderNamespaces)::Entry {
-          return {
-            .key = kj::mv(id),
-            .value = kj::rc<WorkerLoaderNamespace>(*this, kj::mv(il.name)),
-          };
-        }).addRef();
+        KJ_IF_SOME(existing, workerLoaderNamespaces.find(id)) {
+          if (existing->getMaxCachedMemoryBytes() != il.maxCachedMemoryBytes) {
+            errorReporter.addError(kj::str("Worker loader bindings sharing id \"", id,
+                "\" must specify the same maxCachedMemoryBytes value."));
+          }
+          return existing.addRef();
+        }
+
+        auto loader =
+            kj::rc<WorkerLoaderNamespace>(*this, kj::mv(il.name), il.maxCachedMemoryBytes);
+        auto result = loader.addRef();
+        workerLoaderNamespaces.insert(kj::mv(id), kj::mv(loader));
+        return result;
       } else {
         return anonymousWorkerLoaderNamespaces
-            .add(kj::rc<WorkerLoaderNamespace>(*this, kj::mv(il.name)))
+            .add(kj::rc<WorkerLoaderNamespace>(*this, kj::mv(il.name), il.maxCachedMemoryBytes))
             .addRef();
       }
     };

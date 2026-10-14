@@ -74,6 +74,7 @@ jobs:
             --build_tests_only=false --test_output=errors \
             //src/workerd/server:workerd \
             //src/workerd/api/tests:worker-loader-cpu-limit-test@ \
+            //src/workerd/api/tests:worker-loader-eviction-test@ \
             //src/workerd/api/tests:worker-loader-limits-test@ \
             //src/workerd/api/tests:worker-loader-test@
       - name: Save Bazel cache

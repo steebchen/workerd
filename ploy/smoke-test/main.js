@@ -25,10 +25,37 @@ export default {
   }
 };`;
 
+// Holds `mib` MiB per isolate, so a few of them overrun the bounded loader's memory budget.
+const BIG_TENANT = `
+let retained;
+export default {
+  fetch(request) {
+    const mib = Number(new URL(request.url).searchParams.get("mib"));
+    retained ??= new Uint8Array(mib * 1024 * 1024).fill(1);
+    return new Response("big " + retained.byteLength);
+  }
+};`;
+const bigLoads = new Map();
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/ping") return new Response("pong");
+    if (url.pathname === "/big") {
+      const name = url.searchParams.get("name");
+      const worker = env.boundedLoader.get(name, () => {
+        bigLoads.set(name, (bigLoads.get(name) ?? 0) + 1);
+        return {
+          compatibilityDate: "2025-09-15",
+          mainModule: "tenant.js",
+          modules: { "tenant.js": BIG_TENANT },
+          globalOutbound: null,
+        };
+      });
+      const response = await worker.getEntrypoint().fetch(new Request("http://tenant/" + url.search));
+      await response.arrayBuffer();
+      return new Response(name + " loads=" + bigLoads.get(name));
+    }
     if (url.pathname === "/tail-times") return env.tail.fetch("http://tail/");
     if (url.pathname === "/tail-main") return env.tail.fetch("http://tail/main");
     if (url.pathname === "/startup-spin") {
